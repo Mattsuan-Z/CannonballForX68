@@ -1,0 +1,17 @@
+# never commit ROMs or anything made from them
+roms/
+ROMS/
+*.88
+*.133
+*.132
+*.118
+*.117
+*.DAT
+*.dat
+*.HDS
+*.HDF
+*.XDF
+*.X
+*.elf
+build/
+*.ppm

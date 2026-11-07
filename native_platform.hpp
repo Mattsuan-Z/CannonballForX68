@@ -1,0 +1,157 @@
+/* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
+   Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
+   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+// BG/raster road display: the CPU publishes scroll/palette entries, not full frames.
+#include <x68k/iocs.h>
+#include <stdint.h>
+#include <cstdio>
+#include "road_bridge.hpp"
+#include "visuals.hpp"
+#define HW16(a) (*(volatile uint16_t*)(a))
+#define HW8(a) (*(volatile uint8_t*)(a))
+extern "C" {
+void road_vblank_irq();void road_raster_irq();
+RoadRow* volatile road_active=0;
+RoadRow* volatile road_pending=0;
+RoadRow* volatile road_scan=0;
+volatile uint32_t road_vblanks=0,road_shown=0,road_irq_count=0;
+}
+static RoadFrame road_frames[2];
+static int native_old_mode,native_ssp;
+static uint32_t native_started,native_frames;
+static uint32_t native_phase_cs[4],native_mode_cs[2][4];
+static uint32_t native_visual_cs[4][4],native_visual_draws[4],native_visual_steps[4];
+static unsigned native_measuring_visual=0;
+static void native_visual_begin(unsigned mode){native_measuring_visual=mode&3;++native_visual_steps[native_measuring_visual];}
+static void native_visual_end(){}
+
+static uint32_t saved_vblank,saved_raster;
+static uint16_t saved_text_palette[16];
+static bool native_irq_failed=false;
+static uint8_t saved_iera,saved_imra,saved_aer,saved_tacr,saved_tadr;
+static unsigned short mask_irqs(){unsigned short s;__asm__ volatile("move.w %%sr,%0\n\tmove.w #0x2700,%%sr":"=d"(s)::"memory","cc");return s;}
+static void restore_irqs(unsigned short s){__asm__ volatile("move.w %0,%%sr"::"d"(s):"memory","cc");}
+static uint32_t native_clock(){return (uint32_t)_iocs_ontime().sec;}
+// r019 measurement: the 1/100 s clock plus the MFP Timer C counter between ticks.
+// Units are 1/20000 s (50 us), assuming Timer C reloads every 200 counts (checked below).
+static uint32_t fine_last=0,fine_backsteps=0,fine_retries=0;static unsigned fine_tmin=255,fine_tmax=0;
+uint32_t platform_fine_clock(){
+ for(unsigned tries=0;;tries++){
+  uint32_t a=native_clock();unsigned t=HW8(0xe88023);uint32_t b=native_clock();
+  if(a!=b&&tries<4){++fine_retries;continue;}
+  if(t<fine_tmin)fine_tmin=t;
+  if(t>fine_tmax)fine_tmax=t;
+  unsigned within=t>=1&&t<=200?200-t:0;
+  uint32_t v=b*200UL+within;
+  if(v<fine_last){++fine_backsteps;v=fine_last;}
+  fine_last=v;return v;
+ }
+}
+static uint32_t fine_phase[4][4],fine_phase_max[4][4],fine_work_max[4],fine_overruns[4],fine_late[4];
+static uint32_t fine_draw_work=0;
+static uint32_t fine_start=0,fine_phase_start=0;
+static void native_fine_record(unsigned phase){
+ uint32_t n=platform_fine_clock(),d=n-fine_phase_start;fine_phase_start=n;unsigned m=native_measuring_visual;
+ fine_phase[m][phase]+=d;if(d>fine_phase_max[m][phase])fine_phase_max[m][phase]=d;
+ if(phase<3)fine_draw_work+=d;
+}
+static void native_phase_record(unsigned phase,uint32_t start){native_fine_record(phase);uint32_t n=native_clock();uint32_t elapsed=n>=start?n-start:8640000UL-start+n;native_phase_cs[phase]+=elapsed;native_visual_cs[native_measuring_visual][phase]+=elapsed;native_mode_cs[render_schedule.mode()][phase]+=elapsed;}
+static uint32_t native_elapsed(){uint32_t n=native_clock();return n>=native_started?n-native_started:8640000UL-native_started+n;}
+static void platform_present(uint16_t*,uint32_t*){}
+static bool native_key(int sc){return (_iocs_bitsns(sc>>3)&(1<<(sc&7)))!=0;}
+static RoadFrame& platform_road_back(){uint32_t start=native_clock();while(road_pending){if(native_clock()-start>200){native_irq_failed=true;road_pending=0;break;}}if(native_elapsed()>200&&!road_irq_count)native_irq_failed=true;return road_active==road_frames[0].rows?road_frames[1]:road_frames[0];}
+static void platform_road_submit(RoadFrame&f){__asm__ volatile("":::"memory");road_pending=f.rows;++native_frames;++native_visual_draws[native_measuring_visual];}
+static void platform_init(){
+ native_old_mode=_iocs_crtmod(-1);native_ssp=_iocs_b_super(0);for(unsigned i=0;i<16;i++)saved_text_palette[i]=HW16(0xe82200UL+i*2);_iocs_crtmod(10);_iocs_b_curoff();_iocs_sp_init();_iocs_sp_off();
+ HW16(0xe82600)=0;HW16(0xe80028)=(HW16(0xe80028)&0x00ff)|0x0300;HW16(0xeb0808)=0;HW16(0xe8002a)=0;
+ for(unsigned i=0;i<512;i++)HW16(0xeb0000UL+i*2)=0;
+ for(unsigned i=0;i<unsigned(road_atlas.tiles)*16;i++)HW16(0xeb8000UL+i*2)=(unsigned(road_atlas.pcg[i*2])<<8)|road_atlas.pcg[i*2+1];
+ for(unsigned i=0;i<4096;i++){HW16(0xebc000UL+i*2)=road_atlas.map0[i];HW16(0xebe000UL+i*2)=road_atlas.map1[i];}
+ // r023: graphic page 1 starts as off-road; road_stream() fills the rows each frame uses.
+ for(unsigned i=0;i<512UL*512;i++)HW16(0xc00000UL+i*2)=0xf3<<8;
+ visuals_native_init();
+ HW16(0xe80002)=2;HW16(0xe80004)=4;HW16(0xe80006)=44;
+ HW16(0xeb080c)=8;HW16(0xe8000c)=72;HW16(0xe8000e)=520;HW16(0xeb080e)=72;
+ HW16(0xe80012)=1023;HW16(0xe82400)=1;HW16(0xe82500)=0x06e4;HW16(0xe82600)=0x004f;
+ for(unsigned a=0xe80014;a<=0xe80026;a+=2)HW16(a)=0;
+ road_build(hwroad,display_palette,road_frames[0]);road_stream(road_frames[0]);road_active=road_frames[0].rows;
+ unsigned short sr=mask_irqs();
+ saved_vblank=*(volatile uint32_t*)0x134;saved_raster=*(volatile uint32_t*)0x138;
+ saved_iera=HW8(0xe88007);saved_imra=HW8(0xe88013);saved_aer=HW8(0xe88003);saved_tacr=HW8(0xe88019);saved_tadr=HW8(0xe8801f);
+ *(volatile uint32_t*)0x134=(uint32_t)road_vblank_irq;*(volatile uint32_t*)0x138=(uint32_t)road_raster_irq;
+ HW8(0xe88003)=saved_aer&0xef;HW8(0xe88007)=saved_iera|0x60;HW8(0xe88013)=saved_imra|0x60;
+ HW8(0xe8800b)&=0x9f;HW8(0xe8800f)&=0x9f;
+ HW8(0xe88019)=0;HW8(0xe8801f)=1;HW8(0xe88019)=8;
+ HW16(0xeb0808)=0x0219;restore_irqs(sr);
+ native_started=native_clock();native_frames=0;
+ fine_start=fine_phase_start=platform_fine_clock();
+}
+static void platform_sync(int frame){
+ // Use one display period as the deadline; never repay old missed periods.
+ static uint32_t deadline=0;static bool previous30=true;
+ bool mode30=render_schedule.draw30;
+ if(mode30&&!(frame&1))return;
+ uint32_t now=native_elapsed()*60UL;
+ if(previous30!=mode30){deadline=now;previous30=mode30;}
+ deadline+=mode30?200:100;
+ {unsigned m=native_measuring_visual;if(fine_draw_work>fine_work_max[m])fine_work_max[m]=fine_draw_work;fine_draw_work=0;
+  if(now>deadline){++fine_overruns[m];fine_late[m]+=now-deadline;}}
+ if(now>deadline){deadline=now;return;}
+ while(native_elapsed()*60UL<deadline){}
+}
+static unsigned road_map_errors=0,road_pattern_errors=0,road_ground_errors=0;
+static void native_road_memory_check(){
+ unsigned maps=0,patterns=0,ground=0;
+ for(unsigned row=0;row<64;row++)if(row<50||row==60)for(unsigned x=0;x<64;x++){
+  unsigned i=row*64+x;
+  if(HW16(0xebc000UL+i*2)!=road_atlas.map0[i])++maps;
+  if(HW16(0xebe000UL+i*2)!=road_atlas.map1[i])++maps;
+ }
+ for(unsigned i=0;i<unsigned(road_atlas.tiles)*16;i++)if(HW16(0xeb8000UL+i*2)!=((unsigned(road_atlas.pcg[i*2])<<8)|road_atlas.pcg[i*2+1]))++patterns;
+ for(unsigned y=0;y<512;y+=17)for(unsigned x=0;x<512;x+=19){
+  unsigned i=y*512+x;
+  {unsigned v=HW16(0xc00000UL+i*2)>>8;if(v<0xf0||v>0xf7||(v>0xf3&&v<0xf7))++ground;}
+ }
+ road_map_errors=maps;road_pattern_errors=patterns;road_ground_errors=ground;
+}
+static void native_road_memory_report(){ printf("ROAD MEMORY map_errors=%u pattern_errors=%u ground_errors=%u\n",road_map_errors,road_pattern_errors,road_ground_errors);}
+static void platform_exit(){
+ uint32_t t=native_elapsed();unsigned short sr=mask_irqs();
+ HW8(0xe88019)=0;HW16(0xe80012)=1023;HW16(0xeb0808)=0;
+ *(volatile uint32_t*)0x134=saved_vblank;*(volatile uint32_t*)0x138=saved_raster;
+ HW8(0xe88003)=saved_aer;HW8(0xe88007)=saved_iera;HW8(0xe88013)=saved_imra;
+ HW8(0xe8800b)&=0x9f;HW8(0xe8800f)&=0x9f;HW8(0xe8801f)=saved_tadr;HW8(0xe88019)=saved_tacr;
+ native_road_memory_check();
+ // r025: clear the sprite registers (the car stayed on the exit screen) and turn sprites off
+ for(unsigned i=0;i<512;i++)HW16(0xeb0000UL+i*2)=0;
+ // r026e: also clear the PCG/BG area (car and roadside pictures stayed on the exit screen)
+ for(unsigned i=0;i<16384;i++)HW16(0xeb8000UL+i*2)=0;
+ // r027b: the score etc. use all 4 text planes; the console clears only its own
+ for(unsigned p=0;p<4;p++)for(unsigned i=0;i<512*64;i++)HW16(0xe00000UL+p*0x20000UL+i*2)=0;
+ restore_irqs(sr);_iocs_crtmod(native_old_mode);_iocs_sp_off();_iocs_b_curon();for(unsigned i=0;i<16;i++)HW16(0xe82200UL+i*2)=saved_text_palette[i];_iocs_b_clr_al();_iocs_b_locate(0,0);if(native_ssp>0)_iocs_b_super(native_ssp);
+
+ const char* labels[]={"ROAD","BG","CAR","BOTH"};
+ for(unsigned m=0;m<4;m++){
+  uint32_t total=0;for(unsigned k=0;k<4;k++)total+=native_visual_cs[m][k];
+  printf("MODE %s steps=%lu draws=%lu logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu fps_x1000=%lu\n",labels[m],(unsigned long)native_visual_steps[m],(unsigned long)native_visual_draws[m],(unsigned long)native_visual_cs[m][0],(unsigned long)native_visual_cs[m][1],(unsigned long)native_visual_cs[m][2],(unsigned long)native_visual_cs[m][3],total?native_visual_draws[m]*100000UL/total:0);
+ }
+ if(native_irq_failed)puts("ROAD INTERRUPT TIMEOUT - report the counters below.");
+ printf("ROAD BRIDGE r027c 320x224 BG/raster\nframes=%lu shown=%lu cs=%lu fps_x1000=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,t?native_frames*100000UL/t:0);
+ printf("logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\n",(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3]);
+ printf("visual_mode=%u road=%lu bg=%lu car=%lu both=%lu\n",visual_mode,(unsigned long)visual_frames[0],(unsigned long)visual_frames[1],(unsigned long)visual_frames[2],(unsigned long)visual_frames[3]);
+ printf("bg_columns=%lu car_frames=%lu car_tiles=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_tiles_total,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
+ printf("car_text_frames=%lu\n",(unsigned long)car_text_frames);
+ printf("shown_x1000=%lu\n",t?road_shown*100000UL/t:0);
+ printf("vblanks=%lu raster_irqs=%lu\n",(unsigned long)road_vblanks,(unsigned long)road_irq_count);
+ {
+  uint32_t fine_total=fine_last-fine_start;
+  printf("FINE r024 unit=50us total=%lu cs_equiv=%lu tcdr=%u..%u backsteps=%lu retries=%lu\n",(unsigned long)fine_total,(unsigned long)(fine_total/200),fine_tmin,fine_tmax,(unsigned long)fine_backsteps,(unsigned long)fine_retries);
+  for(unsigned m=0;m<4;m++){
+   uint32_t d=native_visual_draws[m];if(!d)continue;
+   printf("FINE %s draws=%lu us/draw logic=%lu table=%lu publish=%lu wait=%lu max_us table=%lu work=%lu overruns=%lu late_cs=%lu\n",labels[m],(unsigned long)d,
+    (unsigned long)(fine_phase[m][0]*50UL/d),(unsigned long)(fine_phase[m][1]*50UL/d),(unsigned long)(fine_phase[m][2]*50UL/d),(unsigned long)(fine_phase[m][3]*50UL/d),
+    (unsigned long)(fine_phase_max[m][1]*50UL),(unsigned long)(fine_work_max[m]*50UL),(unsigned long)fine_overruns[m],(unsigned long)(fine_late[m]/60));
+  }
+ }
+ FILE*f=fopen("ROADPERF.TXT","w");if(f){fprintf(f,"visual_mode=%u\nbackground_columns=%lu\ncar_frames=%lu\ncar_text_frames=%lu\nmax_sprites=%u\nmax_patterns=%u\nmax_line=%u\noverflow=%lu\n",visual_mode,(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_text_frames,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);fprintf(f,"submitted=%lu shown=%lu cs=%lu\nlogic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\nvblanks=%lu raster_irqs=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3],(unsigned long)road_vblanks,(unsigned long)road_irq_count);fclose(f);}
+}
