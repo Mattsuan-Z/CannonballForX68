@@ -6,6 +6,10 @@ by Chris White. X68000 port: **Mattsuan-Z@ColtMaz**.
 **No ROMs are included.** As with Cannonball, you need your own OutRun (Revision B) arcade ROM files.
 `CBX68 TEST` shows a display test that needs no ROM.
 
+**Runs in practice only on the XM6 emulator** (X68030, 100MHz, 68060 x4, 12MB, 060turbo
+memory; see the README below). It is far too heavy for a real X68000 / X68030, WebX68k
+and the X68000 Z.
+
 The program for the X68000 is on the Releases page. The text below is the README included with it.
 
 ## Building
@@ -32,9 +36,16 @@ arcade ROM files.
 
 Requirements
 ------------
-- X68030 with a 68060 (tested on the XM6 emulator: 68060, clock x4, extended ROM on,
-  "MPU speed-up" on, main memory 12MB, "VM sync to PC VSYNC" off)
-- Human68k
+IMPORTANT: this program is far too heavy for a real X68000 / X68030, for WebX68k
+and for the X68000 Z. In practice it runs only on the XM6 emulator with these settings:
+- Model X68030, 100MHz, MPU 68060 with clock x4, FPU on, extended ROM on
+  (needed to start with the 68060), "MPU speed-up" on
+- Main memory 12MB, extended memory 060turbo 256MB
+- MPU / VM no-wait off, "VM sync to PC VSYNC" off
+- Human68k (3.02)
+Even with these settings the speed drops in busy scenes. Real hardware, WebX68k and
+the X68000 Z have not been tested and are not expected to run it at a usable speed
+(not supported).
 
 How to use
 ----------
@@ -89,6 +100,17 @@ OutRunはSEGAの商標です。
 
 ROMは含まれていません。Cannonballと同じく、ご自身でお持ちのアーケード版OutRun
 （Revision B）のROMファイルが必要です。
+
+動作環境（重要）
+このプログラムは非常に重く、実機のX68000／X68030、WebX68k、X68000 Z では
+まともに動きません。実際に動くのは、次の設定のエミュレーター XM6 だけです。
+- 機種 X68030、100MHz、MPU 68060・クロック4倍、FPU有効、拡張ROM有効
+  （68060で起動するのに必要）、「MPU高速化を許可」オン
+- メインメモリ 12MB、拡張メモリ 060turbo 256MB
+- MPU・VMのノーウェイトはオフ、「VMをPCのVSYNCに同期」はオフ
+- Human68k（3.02）
+この設定でも、景物の多い場面では処理落ちします。実機・WebX68k・X68000 Z では
+確認しておらず、実用的な速度で動く見込みはありません（非対応）。
 
 使い方
 1. CBX68.X、TILEMAP.BIN、TILEPAT.BIN を同じフォルダーに置く

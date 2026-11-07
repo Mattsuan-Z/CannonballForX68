@@ -1,8 +1,8 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 #pragma once
-// r010 (Claude comparison build): exact sprite kernels.
+// Exact sprite kernels (same pixels as the original renderer).
 //
 // Every row restarts the horizontal accumulator at 0, so output pixel j of a row samples
 // source pixel floor(j*hz/512).  With acc kept in [0,hz) at word boundaries, one 8-pixel

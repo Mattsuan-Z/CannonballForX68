@@ -1,6 +1,6 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 // Offline reference methods: original algorithms retained for pixel comparison.
 // Copyright Aaron Giles. All rights reserved. Based on MAME source code.
 // See CANNONBALL_LICENSE.txt and the notices in vendor/main/hwvideo.

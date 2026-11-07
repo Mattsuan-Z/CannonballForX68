@@ -1,6 +1,6 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 #include "draw_profile.hpp"
 #ifdef OR_X68K
 #include <x68k/iocs.h>

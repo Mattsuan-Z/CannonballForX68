@@ -1,6 +1,6 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 // Cannonball for x68: DISPLAY TEST (CBX68 TEST). Needs no ROM: the road, background, sprite and
 // font pictures are simple shapes made here, and the game itself (Cannonball) does not run.
 // It drives the same X68000 display code as the game (raster road, 4-bit background planes,

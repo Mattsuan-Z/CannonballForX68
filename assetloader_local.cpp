@@ -1,6 +1,6 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 // Cannonball for x68: ROM file loader (replaces the PC version's assetloader.cpp).
 // As in Cannonball, the program uses the user's own OutRun (Revision B) ROM files; nothing
 // from the ROMs is distributed with it. Each file is read from the ROM folder by name and its

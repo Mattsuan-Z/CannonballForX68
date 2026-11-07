@@ -1,6 +1,6 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
 // Host check (r022): road rows against the software road renderer.
 // One-road lines shown from graphic page 1 must match exactly. On two-road lines the second
 // road comes from the 80-step BG atlas, so pixels covered by it are counted, not failed; lines

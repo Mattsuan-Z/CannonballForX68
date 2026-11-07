@@ -1,7 +1,7 @@
 /* Cannonball for x68 - X68000 port by Mattsuan-Z@ColtMaz.
    Part of a derivative work of Cannonball (Copyright Chris White and the Cannonball team),
-   released under the Cannonball licence (LICENSE.txt). Other notices below are kept as they were. */
-// Host-only workload counter for the sprite layer (r010 Claude comparison build).
+   released under the Cannonball licence (LICENSE / LICENSE.txt). Other notices below are kept as they were. */
+// Host-only workload counter for the sprite layer.
 // Walks the same sprite list as hwsprites::render_reference without touching pixels,
 // so the 68000 kernel can be chosen from counted work instead of guesses.
 #ifndef OR_X68K
