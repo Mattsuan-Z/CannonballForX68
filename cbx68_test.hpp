@@ -5,10 +5,11 @@
 // font pictures are simple shapes made here, and the game itself (Cannonball) does not run.
 // It drives the same X68000 display code as the game (raster road, 4-bit background planes,
 // sprites reused down the screen, text plane), so it shows whether the display works on a
-// machine or emulator. Nothing here is taken from or imitates the arcade game.
+// machine or emulator. Nothing here is taken from or imitates the original game.
 #pragma once
 #include <cmath>
 static bool cbx68_test=false;
+static bool cbx68_test_heavy=false;   // r028: CBX68 TEST HEAVY / L key - load close to the game's busy scenes
 static unsigned cbx68_test_key=0;
 static inline uint16_t cbx68_rgb(unsigned r,unsigned g,unsigned b){return uint16_t(((g&31)<<11)|((r&31)<<6)|((b&31)<<1));}
 // 5x7 font for the text (own design): 7 rows of 5 bits per character
@@ -59,6 +60,12 @@ static void cbx68_test_assets(){
     w=(w<<4)|c;}
    put(s*256+y*5+wx,w);}
   put(s*256+y*5+4,0xffffffffu);}
+ // r028: shape 4 (heavy test): a 32x48 tower with 14 colour bands (uses a whole 16-colour bank)
+ for(unsigned y=0;y<48;y++){
+  for(unsigned wx=0;wx<4;wx++){uint32_t w=0;for(unsigned i=0;i<8;i++){int x=int(wx*8+i),dx=x-16;unsigned c=0;
+    const int half=y<8?int(y)+4:(y<40?12:3);if(std::abs(dx)<half)c=1+((y/3+unsigned(std::abs(dx))/4)%14);w=(w<<4)|c;}
+   put(4*256+y*5+wx,w);}
+  put(4*256+y*5+4,0xffffffffu);}
  // palette (X68000 colour words)
  for(unsigned i=0;i<16;i++){display_palette[0x400+i]=cbx68_rgb(i&1?11:13,i&1?11:13,i&1?12:14);}
  display_palette[0x402]=display_palette[0x403]=cbx68_rgb(31,31,31);display_palette[0x404]=display_palette[0x405]=cbx68_rgb(31,28,8);
@@ -73,6 +80,9 @@ static void cbx68_test_assets(){
  const uint16_t sp[16]={0,cbx68_rgb(31,24,8),cbx68_rgb(28,14,4),cbx68_rgb(18,6,2),cbx68_rgb(4,22,6),cbx68_rgb(2,14,4),cbx68_rgb(14,8,4),
   cbx68_rgb(31,31,31),cbx68_rgb(4,10,28),cbx68_rgb(28,4,8),cbx68_rgb(20,8,30),cbx68_rgb(31,20,31),0,0,0,0};
  for(unsigned b=0;b<4;b++)for(unsigned n=0;n<16;n++){uint16_t c=sp[n];if(b&&n)c=uint16_t(((c>>1)&0x7bde)+(b*0x0842));display_palette[0x800+b*16+n]=n?c:0;}
+ // r028: banks 4..15 for the heavy test: 14 colours each, a different hue per bank
+ for(unsigned b=4;b<16;b++)for(unsigned n=1;n<15;n++){unsigned h=(b*5+n)%24,l=6+n*25/14;unsigned r=h<8?l:(h<16?31-l:l/3),g=h<8?l/3:(h<16?l:31-l),bl=h<8?31-l:(h<16?l/3:l);
+  display_palette[0x800+b*16+n]=cbx68_rgb(r&31,g&31,bl&31);}
 }
 static void cbx68_text(unsigned row,unsigned col,unsigned colour,const char*s){
  uint8_t*tr=video.tile_layer->text_ram;
@@ -92,7 +102,7 @@ static void cbx68_test_setup(){
  memset(video.tile_layer->text_ram,0,0xe00);
  cbx68_text(1,4,2,"CANNONBALL FOR X68  DISPLAY TEST");
  cbx68_text(2,8,0,"NO ROM - SHAPES MADE HERE");
- cbx68_text(26,1,1,"ESC: QUIT  1-4: DISPLAY");
+ cbx68_text(26,1,1,"ESC: QUIT  1-4: DISPLAY  L: LOAD");
  hwroad.road_control=4;video.sprite_layer->set_x_clip(false);
 }
 // One frame: the road bends and rises, both background layers scroll, shapes come up the road.
@@ -114,20 +124,27 @@ static void cbx68_test_frame(int frame){
  cbx68_word(0xe9a,unsigned(192-fx)&0x3ff);cbx68_word(0xe98,unsigned(192-nx)&0x3ff);
  cbx68_word(0xe92,unsigned(256-horizon)&511);cbx68_word(0xe90,unsigned(256-horizon)&511);
  // shapes on both sides of the road, far ones first (near ones are drawn over them)
- unsigned n=0;const int count=24;
+ unsigned n=0;const int count=cbx68_test_heavy?40:24;
  for(int k=count-1;k>=0;k--){
   const double p=std::fmod(t*0.35+k/double(count),1.0);          // 0 far .. 1 near
   const double s=0.05+p*p*2.6;const int rows=std::max(2,std::min(256,int(32*s)));
   const int depth=223-horizon;const int ybot=horizon+int(depth*p*p);if(ybot>=224)continue;
   const double far=1.0-p*p;const int cxr=160-int(curve*130*far*far);
   const int side=(k&1)?1:-1;const int half=int((8+230*p*p)*0.5)+rows/2+4;
-  const int x=cxr+side*half-rows/2;const unsigned shape=unsigned(k%4);
+  const int x=cxr+side*half-rows/2;const unsigned shape=cbx68_test_heavy&&(k%3)==0?4u:unsigned(k%4);
+  const unsigned bank=cbx68_test_heavy?(shape==4?4+unsigned(k/3)%12:unsigned(k%4)):unsigned(shape&3);
+  const unsigned srch=shape==4?48u:32u,hrows=unsigned(std::max(2,std::min(256,int(srch*s))));
   const unsigned z=unsigned(32*0x200/rows);
   osprite&e=osprites.sprite_entries[n];uint16_t*r=e.data;e.scratch=n;
-  r[0]=uint16_t((ybot-rows+256)&511);r[1]=uint16_t(shape*256);r[2]=uint16_t(5<<9);r[3]=uint16_t(0x3000|std::min(2047u,z));
-  r[4]=uint16_t(0x8000|0x4000|0x2000|std::min(2047u,z));r[5]=uint16_t(((rows-1)<<8)|(shape&3));r[6]=uint16_t(x+190);
+  r[0]=uint16_t((ybot-int(hrows)+256)&511);r[1]=uint16_t(shape*256);r[2]=uint16_t(5<<9);r[3]=uint16_t(0x3000|std::min(2047u,z));
+  r[4]=uint16_t(0x8000|0x4000|0x2000|std::min(2047u,z));r[5]=uint16_t(((hrows-1)<<8)|bank);r[6]=uint16_t(x+190);
   ++n;
+  // r028 heavy: a second shape on the road for every 4th one (like cars ahead)
+  if(cbx68_test_heavy&&(k&3)==1&&n<120){const unsigned rr=unsigned(rows);osprite&c=osprites.sprite_entries[n];uint16_t*q=c.data;c.scratch=n;
+   const int lane=(k&4)?-1:1;const int cx=cxr+lane*int((8+230*p*p)*0.25)-int(rr)/2;
+   q[0]=uint16_t((ybot-int(rr)+256)&511);q[1]=uint16_t(3*256);q[2]=uint16_t(5<<9);q[3]=uint16_t(0x3000|std::min(2047u,z));
+   q[4]=uint16_t(0x8000|0x4000|0x2000|std::min(2047u,z));q[5]=uint16_t(((rr-1)<<8)|unsigned(k%4));q[6]=uint16_t(cx+190);++n;}
  }
  osprites.sprite_count=uint16_t(n);
- char line[48];snprintf(line,sizeof line,"FRAME %06d  KEY %03u",frame,cbx68_test_key);cbx68_text(25,1,0,line);
+ char line[48];snprintf(line,sizeof line,"FRAME %06d  KEY %03u %s",frame,cbx68_test_key,cbx68_test_heavy?"HEAVY":"LIGHT");cbx68_text(25,1,0,line);
 }

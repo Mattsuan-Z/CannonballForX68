@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "report_pager.hpp"
 #include <algorithm>
 BackgroundAssets background_assets;
 unsigned visual_mode=0;
@@ -203,6 +204,45 @@ static bool background_prepare(const uint16_t*pal){
  if(!ok&&was_ready!=ok)++background_capacity_waits;
  return background_ready;
 }
+// r030: full-screen tile pictures with more colours than the two 15-colour layers can hold
+// (the music select screen: about 60 colours). Both tile layers are composed into one 8-bit
+// picture: the far and near nibble planes at the same scroll show a byte as one 256-colour
+// index (1..239; 240.. are the road's). Each tile colour index gets its own slot, so a palette
+// change only rewrites colours. Used only for a still picture (pages decoded, the same tile RAM,
+// pages and scroll as the frame before), composed once; when the two layers fit again, the ring
+// background is rebuilt in full (its video memory was overwritten).
+extern uint32_t video_tile_ram_writes;
+static bool static_on=false,static_dirty=false,static_pal_dirty=false;
+static uint8_t static_img[320*224];
+static uint16_t static_colour[240],static_index[240];static unsigned static_ncol=0;
+static uint32_t static_key[7],static_seen[7];
+static uint8_t static_slot_of[8192];
+static uint32_t static_composes=0,static_frames=0;
+static bool static_prepare(const uint16_t*pal){
+ for(unsigned l=0;l<2;l++)for(unsigned q=0;q<4;q++){unsigned p=bg_layer[l].page[q];if(!page_cache[p].valid||page_stale(p))return false;}
+ const uint32_t key[7]={tile_word(0xe80),tile_word(0xe82),tile_word(0xe90),tile_word(0xe92),tile_word(0xe98),tile_word(0xe9a),video_tile_ram_writes};
+ const bool still=!memcmp(key,static_seen,sizeof key);memcpy(static_seen,key,sizeof key);
+ if(static_on&&!memcmp(key,static_key,sizeof key)){
+  for(unsigned s=1;s<=static_ncol;s++){const uint16_t c=opaque_colour(pal[static_index[s]]);if(c!=static_colour[s]){static_colour[s]=c;static_pal_dirty=true;}}
+  return true;
+ }
+ if(!still)return false;   // moving: wait until it stands still (one frame)
+ ++static_composes;
+ static uint16_t buf[320*224];memset(buf,0,sizeof buf);
+ video.tile_layer->update_tile_values();
+ video.tile_layer->render_tile_layer(buf,1,0);video.tile_layer->render_tile_layer(buf,0,0);   // as Video::prepare_frame
+ for(unsigned s=1;s<=static_ncol;s++)static_slot_of[static_index[s]]=0;
+ static_ncol=0;bool ok=true;
+ for(unsigned i=0;i<320*224;i++){
+  const unsigned v=buf[i]&8191;if(!v){static_img[i]=0;continue;}
+  unsigned s=static_slot_of[v];
+  if(!s){if(static_ncol>=239){ok=false;break;}s=++static_ncol;static_index[s]=uint16_t(v);static_colour[s]=opaque_colour(pal[v]);static_slot_of[v]=uint8_t(s);}
+  static_img[i]=uint8_t(s);
+ }
+ if(!ok){for(unsigned s=1;s<=static_ncol;s++)static_slot_of[static_index[s]]=0;static_ncol=0;static_on=false;return false;}
+ memcpy(static_key,key,sizeof key);static_on=true;static_dirty=true;
+ return true;
+}
 static bool near_has(unsigned nx,unsigned ny){unsigned q=(ny>=256?2:0)+(nx>=512?1:0);const PageMeta&m=page_cache[bg_layer[0].page[q]].m;unsigned r=ny&255,x=nx&511;return m.rowany[r]&&x>=m.rmin[r]&&x<=m.rmax[r];}
 static bool near_row_any(unsigned ny){unsigned h=ny>=256?2:0;const BgLayer&L=bg_layer[0];return page_cache[L.page[h]].m.rowany[ny&255]||page_cache[L.page[h+1]].m.rowany[ny&255];}
 static inline uint8_t layer_value(unsigned l,unsigned x,unsigned y){
@@ -380,6 +420,12 @@ static void ring_stream(unsigned l,int target,unsigned y0,unsigned shown,bool re
 #endif
 }
 static void stream_hud(const HudPacket&H);
+// r029: called after the frame before has been taken by the vertical blank (the frame is built
+// earlier, while that one was still waiting): the text bank for the car on the text plane is
+// chosen now, from the bank that is actually shown.
+void visuals_handoff(RoadFrame&f){
+ if(f.visual.car.text_mode&&!hud_enabled)f.visual.car.text_bank=uint16_t(1-text_active_bank);
+}
 void visuals_stream(const RoadFrame&f){
  stream_hud(f.visual.hud);   // r027
 #ifdef OR_X68K
@@ -391,6 +437,22 @@ void visuals_stream(const RoadFrame&f){
   }
  }
 #endif
+ if(f.visual.flags&4){   // r030: the 8-bit picture (rows and columns 0.., both nibble planes)
+#ifdef OR_X68K
+  if(static_dirty||static_pal_dirty)for(unsigned s=1;s<=static_ncol;s++)*(volatile uint16_t*)(0xe82000UL+s*2)=static_colour[s];
+#endif
+  static_pal_dirty=false;
+  if(static_dirty){
+#ifdef OR_X68K
+   for(unsigned y=0;y<224;y++){volatile uint8_t*d=(volatile uint8_t*)(0xc00001UL+y*1024UL);const uint8_t*src=static_img+y*320;
+    for(unsigned x=0;x<320;x++)d[x*2]=src[x];}
+#else
+   for(unsigned y=0;y<224;y++)memcpy(background_ring+y*512,static_img+y*320,320);
+#endif
+   static_dirty=false;
+  }
+  return;
+ }
  if(!(f.visual.flags&1)||!background_ready)return;
 #ifdef OR_X68K
  // r025: palette index f*16+n (f = far slot 0..14, n = near slot 0..15)
@@ -761,6 +823,7 @@ alignas(4) static uint16_t scenery_std[320*224];   // PC: the original capture, 
 #endif
 static uint32_t scenery_car_dropped=0,scenery_shared_total=0,scenery_frames=0,scenery_count_total=0,scenery_dropped_total=0,scenery_reused_total=0,scenery_bank_drops=0,scenery_overflow=0;
 static unsigned scenery_peak=0,scenery_line_peak=0,scenery_block_peak=0;
+static uint32_t scenery_reuse_frames=0;   // r030
 uint32_t scenery_fine_total=0,scenery_fine_capture=0,scenery_fine_max=0,scenery_fine_colour=0,scenery_fine_tiles=0;
 static const unsigned SCENERY_LINE_BUDGET=96;   // longs per raster interrupt (two patterns + registers)
 #ifndef OR_X68K
@@ -802,19 +865,43 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
    for(unsigned n=1;n<15;n++)if(mask&(1u<<n)){unsigned idx=bank*16+n;pidx[j][pn[j]]=uint16_t(idx);pcol[j][pn[j]]=pal[idx];pn[j]++;}
    order[j]=uint16_t(j);}
   std::sort(order,order+np,[](uint16_t a,uint16_t b){return pn[a]>pn[b]||(pn[a]==pn[b]&&a<b);});
+  // r028: which blocks already hold a colour, as a small hash table colour -> block bits (same
+  // choices as the r026e search over every block and colour, without the nested compares)
+  static uint16_t ch_key[512],ch_mask[512],ch_list[512];static uint8_t ch_used[512];unsigned ch_n=0;
+  auto ch_slot=[&](uint16_t c)->unsigned{unsigned h=((c*40503u)>>7)&511;while(ch_used[h]&&ch_key[h]!=c)h=(h+1)&511;return h;};
   for(unsigned o=0;o<np;o++){unsigned j=order[o];int best=-1;unsigned best_new=99;
-   for(unsigned b=0;b<S.blocks;b++){unsigned add=0;
-    for(unsigned c=0;c<pn[j];c++){bool f=false;for(unsigned n=1;n<=bcount[b];n++)if(S.palette[b][n]==pcol[j][c]){f=true;break;}
-     if(!f){bool dup=false;for(unsigned c2=0;c2<c;c2++)if(pcol[j][c2]==pcol[j][c]){dup=true;break;}if(!dup)++add;}}
+   uint16_t um[15];unsigned nu=0;   // block bits of the bank's distinct colours (first occurrence order)
+   for(unsigned c=0;c<pn[j];c++){bool dup=false;for(unsigned c2=0;c2<c;c2++)if(pcol[j][c2]==pcol[j][c]){dup=true;break;}
+    if(!dup){const unsigned h=ch_slot(pcol[j][c]);um[nu++]=ch_used[h]?ch_mask[h]:0;}}
+   for(unsigned b=0;b<S.blocks;b++){unsigned add=0;const unsigned bit=1u<<b;
+    for(unsigned u=0;u<nu;u++)if(!(um[u]&bit))++add;
     if(bcount[b]+add<=15&&add<best_new){best=int(b);best_new=add;}}
    if(best<0&&S.blocks<block_limit){best=S.blocks++;bcount[best]=0;}
    if(best<0)continue;   // placed when met
    bank_block[plan_bank[j]]=int8_t(best);
    for(unsigned c=0;c<pn[j];c++){unsigned n=1;for(;n<=bcount[best];n++)if(S.palette[best][n]==pcol[j][c])break;
-    if(n>bcount[best]){n=++bcount[best];S.palette[best][n]=pcol[j][c];}
+    if(n>bcount[best]){n=++bcount[best];S.palette[best][n]=pcol[j][c];
+     const unsigned h=ch_slot(pcol[j][c]);if(!ch_used[h]){ch_used[h]=1;ch_key[h]=pcol[j][c];ch_mask[h]=0;ch_list[ch_n++]=uint16_t(h);}ch_mask[h]|=uint16_t(1u<<best);}
     scenery_map[pidx[j][c]]=uint8_t(((best+1)<<4)|n);scenery_used[nused++]=pidx[j][c];}
   }
+  for(unsigned k=0;k<ch_n;k++)ch_used[ch_list[k]]=0;
  }
+ // r030: a frame whose roadside sprites are the same as in the last computed frame (same
+ // entries, palette plan and colours; e.g. standing at the start) takes that frame's tiles
+ // instead of capturing and converting again (the same result). Not on colour-learning frames.
+ const bool learn=(scenery_frames&7)==0;
+ static uint16_t reuse_key[256*23+256],reuse_new[256*23+256];static unsigned reuse_len=0;static bool reuse_valid=false;
+ unsigned key_len=0;bool key_ok=sprites_on&&scenery_enabled;
+ if(key_ok){
+  reuse_new[key_len++]=uint16_t(car_blocks);reuse_new[key_len++]=S.blocks;
+  for(unsigned b=0;b<S.blocks;b++){reuse_new[key_len++]=uint16_t(bcount[b]);for(unsigned n=1;n<=bcount[b];n++)reuse_new[key_len++]=S.palette[b][n];}
+  for(unsigned i=0;i<osprites.sprite_count&&key_ok;i++){const osprite&e=osprites.sprite_entries[i];const uint16_t*r=e.data;
+   if((r[0]&0xd000)||((r[3]>>12)&3)!=3||scenery_is_car(e.scratch))continue;
+   if(key_len+23>sizeof reuse_new/2){key_ok=false;break;}
+   for(unsigned k=0;k<7;k++)reuse_new[key_len++]=r[k];
+   const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);for(unsigned n=0;n<16;n++)reuse_new[key_len++]=pal[base|n];}
+ }
+ const bool reuse=key_ok&&!learn&&reuse_valid&&key_len==reuse_len&&!memcmp(reuse_new,reuse_key,key_len*2);
  // 1. capture
 #ifdef OR_X68K
  uint32_t tc=platform_fine_clock();
@@ -835,7 +922,7 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
   // r026e: drawn straight into palette-block codes ((block+1)<<4|index); colours not planned
   // keep their palette index (>= 0x800) and are placed in the tile pass. Shadow pixels are left
   // out (no darkening on the X68000).
-  {uint16_t table[16];const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);const bool shadow=(r[3]&0x4000)!=0;
+  if(!reuse){uint16_t table[16];const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);const bool shadow=(r[3]&0x4000)!=0;
    for(unsigned k=0;k<16;k++){if(k==0||k==15||(shadow&&k==10)){table[k]=0;continue;}unsigned q=scenery_map[base|k];table[k]=uint16_t(q==255?0:q?q:(base|k));}
    video.sprite_layer->capture_entry_table(r,scenery_pixels,table);}
 #ifndef OR_X68K
@@ -888,33 +975,67 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
  static uint32_t sprite_hash[SCENERY_MAX];
  // r026d: fast path for colours already placed; colours are learned on every 8th frame only;
  // pixel pairs that are both empty are skipped; one-block tiles are encoded without tests.
- const bool learn=(scenery_frames&7)==0;
  static uint8_t met_q[256];
- for(int ty=low/16;ty<(high+15)/16;ty++)for(unsigned tx=0;tx<20;tx++){
-  uint8_t m[256];unsigned mask=0;
-  for(unsigned yy=0;yy<16;yy++){unsigned y=ty*16+yy;uint8_t*mr=m+yy*16;alias_u32*m32=(alias_u32*)mr;
-   if(y>=224){m32[0]=m32[1]=m32[2]=m32[3]=0;continue;}
-   uint16_t*src=scenery_pixels+y*320+tx*16;alias_u32*s32=(alias_u32*)src;
-   if(!(s32[0]|s32[1]|s32[2]|s32[3]|s32[4]|s32[5]|s32[6]|s32[7])){m32[0]=m32[1]=m32[2]=m32[3]=0;continue;}
-   for(unsigned xx=0;xx<16;xx+=2){
-    if(!s32[xx>>1]){mr[xx]=mr[xx+1]=0;continue;}
-    for(unsigned d=0;d<2;d++){unsigned q=src[xx+d];
-     if(q>=256)q=lookup(q);   // a colour that was not planned
-     if(q){if(learn)met_q[q]=1;mask|=1u<<((q>>4)-1);}
-     mr[xx+d]=uint8_t(q);}}
-   s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
-  if(!mask)continue;
-  const bool single=!(mask&(mask-1));
-  for(unsigned b=0;mask;b++,mask>>=1){if(!(mask&1))continue;
-   if(S.count>=SCENERY_MAX){++S.dropped;++scenery_overflow;continue;}
+ // r028: one pass per tile builds the 16 rows of nibbles and the block mask together. Most tiles
+ // have one palette block: their pattern is finished by that pass (no second pass over the tile).
+ // Tiles with more blocks split all blocks in one more pass. Same output as r026e: colours are
+ // looked up in the same pixel order, and the patterns, hashes and sprite order are unchanged.
+ static uint16_t block_bit[256];static bool block_bit_init=false;
+ if(!block_bit_init){for(unsigned q=0;q<256;q++)block_bit[q]=uint16_t(q>=16?1u<<((q>>4)-1):0);block_bit_init=true;}
+ if(!reuse)for(int ty=low/16;ty<(high+15)/16;ty++){
+  const unsigned rows=unsigned(std::min(16,224-ty*16));
+  for(unsigned tx=0;tx<20;tx++){
+  uint32_t rowL[16],rowR[16];unsigned mask=0,rowbits=0;
+  uint16_t*const tile_src=scenery_pixels+ty*16*320+tx*16;
+  for(unsigned yy=0;yy<rows;yy++){
+   uint16_t*src=tile_src+yy*320;alias_u32*s32=(alias_u32*)src;
+   if(!(s32[0]|s32[1]|s32[2]|s32[3]|s32[4]|s32[5]|s32[6]|s32[7])){rowL[yy]=rowR[yy]=0;continue;}
+   uint32_t a=0,b=0;
+   for(unsigned xx=0;xx<8;xx+=2){unsigned q0=0,q1=0;
+    if(s32[xx>>1]){q0=src[xx];q1=src[xx+1];
+     if(q0>=256)q0=lookup(q0);   // a colour that was not planned (same order as before)
+     if(q1>=256)q1=lookup(q1);
+     mask|=block_bit[q0]|block_bit[q1];
+     if(learn){met_q[q0]=1;met_q[q1]=1;}}
+    a=(a<<8)|((q0&15)<<4)|(q1&15);}
+   for(unsigned xx=8;xx<16;xx+=2){unsigned q0=0,q1=0;
+    if(s32[xx>>1]){q0=src[xx];q1=src[xx+1];
+     if(q0>=256)q0=lookup(q0);
+     if(q1>=256)q1=lookup(q1);
+     mask|=block_bit[q0]|block_bit[q1];
+     if(learn){met_q[q0]=1;met_q[q1]=1;}}
+    b=(b<<8)|((q0&15)<<4)|(q1&15);}
+   rowL[yy]=a;rowR[yy]=b;rowbits|=1u<<yy;}
+  if(!mask){   // r028 fix: pixels whose colour was dropped (no palette room) are cleared too
+   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   continue;}
+  for(unsigned yy=rows;yy<16;yy++)rowL[yy]=rowR[yy]=0;
+  if(!(mask&(mask-1))){   // one block: the nibbles are the pattern
+   const unsigned bnum=unsigned(__builtin_ctz(mask));
+   if(S.count>=SCENERY_MAX){++S.dropped;++scenery_overflow;
+    for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+    continue;}
    ScenerySprite&sp=S.sprite[S.count];uint32_t*enc=S.pcg[S.count];
-   sp.x=int16_t(tx*16+16);sp.y=int16_t(ty*16+16);sp.block=uint8_t(b);sp.row=uint8_t(ty);sp.kept=0;
-   const unsigned want=(b+1)<<4;uint32_t h=2166136261UL;
-   for(unsigned yy=0;yy<16;yy++){const uint8_t*mr=m+yy*16;uint32_t L=0,R=0;
-    if(single)for(unsigned xx=0;xx<8;xx++){L=(L<<4)|(mr[xx]&15);R=(R<<4)|(mr[xx+8]&15);}
-    else for(unsigned xx=0;xx<8;xx++){unsigned a=mr[xx],c=mr[xx+8];L=(L<<4)|((a&0xf0)==want?a&15:0);R=(R<<4)|((c&0xf0)==want?c&15:0);}
-    const unsigned w=(yy>>3)*8+(yy&7);enc[w]=L;enc[w+16]=R;h^=L;h*=16777619UL;h^=R;h*=16777619UL;}
+   sp.x=int16_t(tx*16+16);sp.y=int16_t(ty*16+16);sp.block=uint8_t(bnum);sp.row=uint8_t(ty);sp.kept=0;
+   uint32_t h=2166136261UL;
+   for(unsigned yy=0;yy<16;yy++){const uint32_t l=rowL[yy],r=rowR[yy];enc[yy]=l;enc[yy+16]=r;h^=l;h*=16777619UL;h^=r;h*=16777619UL;}
    sprite_hash[S.count]=h;++S.count;
+   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   continue;}
+  // several blocks: one sprite per block, in block order (dropped when the list is full)
+  unsigned ord[16],blocks_here[16],nb=0;
+  for(unsigned b=0,mm=mask;mm;b++,mm>>=1)if(mm&1){ord[b+1]=nb;blocks_here[nb++]=b;}
+  unsigned first=S.count,take=0;
+  for(unsigned j=0;j<nb;j++){if(S.count>=SCENERY_MAX){++S.dropped;++scenery_overflow;continue;}++S.count;++take;}
+  uint32_t hj[16];for(unsigned j=0;j<take;j++){hj[j]=2166136261UL;
+   ScenerySprite&sp=S.sprite[first+j];sp.x=int16_t(tx*16+16);sp.y=int16_t(ty*16+16);sp.block=uint8_t(blocks_here[j]);sp.row=uint8_t(ty);sp.kept=0;}
+  for(unsigned yy=0;yy<16;yy++){uint32_t lj[16]={0},rj[16]={0};
+   if(rowbits&(1u<<yy)){uint16_t*src=tile_src+yy*320;   // read again: every colour is placed by now
+    for(unsigned xx=0;xx<8;xx++){unsigned q=src[xx];if(q>=256)q=lookup(q);if(q){unsigned j=ord[q>>4];lj[j]|=uint32_t(q&15)<<(28-4*xx);}
+     q=src[xx+8];if(q>=256)q=lookup(q);if(q){unsigned j=ord[q>>4];rj[j]|=uint32_t(q&15)<<(28-4*xx);}}
+    alias_u32*s32=(alias_u32*)src;s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   for(unsigned j=0;j<take;j++){uint32_t*enc=S.pcg[first+j];enc[yy]=lj[j];enc[yy+16]=rj[j];hj[j]^=lj[j];hj[j]*=16777619UL;hj[j]^=rj[j];hj[j]*=16777619UL;}}
+  for(unsigned j=0;j<take;j++)sprite_hash[first+j]=hj[j];
   }
  }
  // learn which colours each bank uses (planned and met), then clear the tables
@@ -922,6 +1043,15 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
  if(learn)memset(met_q,0,sizeof met_q);
  for(unsigned k=0;k<nbank;k++)bank_block[bank_list[k]]=-1;
  for(unsigned b=0;b<S.blocks;b++)for(unsigned n=bcount[b]+1;n<16;n++)S.palette[b][n]=0;
+ // r030: keep this frame's tiles for a frame with the same sprites, or take the kept ones
+ {static uint16_t c_count,c_blocks,c_dropped,c_dropped_banks;static uint16_t c_palette[13][16];
+  static ScenerySprite c_sprite[SCENERY_MAX];static uint32_t c_pcg[SCENERY_MAX][32],c_hash[SCENERY_MAX];
+  if(reuse){S.count=c_count;S.blocks=c_blocks;S.dropped=c_dropped;S.dropped_banks=c_dropped_banks;memcpy(S.palette,c_palette,sizeof c_palette);
+   memcpy(S.sprite,c_sprite,S.count*sizeof c_sprite[0]);memcpy(S.pcg,c_pcg,S.count*sizeof c_pcg[0]);memcpy(sprite_hash,c_hash,S.count*4);++scenery_reuse_frames;}
+  else if(key_ok){c_count=S.count;c_blocks=S.blocks;c_dropped=S.dropped;c_dropped_banks=S.dropped_banks;memcpy(c_palette,S.palette,sizeof c_palette);
+   memcpy(c_sprite,S.sprite,S.count*sizeof c_sprite[0]);memcpy(c_pcg,S.pcg,S.count*sizeof c_pcg[0]);memcpy(c_hash,sprite_hash,S.count*4);
+   memcpy(reuse_key,reuse_new,key_len*2);reuse_len=key_len;reuse_valid=true;}
+  else reuse_valid=false;}
 #ifdef OR_X68K
  uint32_t ts=platform_fine_clock();scenery_fine_tiles+=ts-tp;
 #endif
@@ -1233,17 +1363,23 @@ void visuals_build(RoadFrame&f,const uint16_t*pal){
  background_palette=pal;
  if(visual_mode&1)page_idle_step();   // r024d: a finished page is taken over by background_prepare in the same frame
  bool show_background=(visual_mode&1)&&background_prepare(pal);
+ // r030: a full-screen picture that the two layers cannot hold is shown as one 8-bit picture
+ const bool show_static=!show_background&&(visual_mode&1)&&static_prepare(pal);
+ if(!show_static&&static_on){static_on=false;background_refresh=true;background_palette_refresh=true;}
+ if(show_static){v.flags|=4;v.pad=0;++static_frames;}
  near_target=unwrap_target(near_target,192-tile_word(0xe98),1024);
  far_target=unwrap_target(far_target,192-tile_word(0xe9a),1024);
  if(show_background)++background_source_frames;
  v.near_world=near_target;v.far_world=far_target;
+ if(show_static)v.near_world=v.far_world=0;   // r030: the picture is at columns 0..319
  for(int y=0;y<224;y++){
   f.rows[y].bg_y=f.rows[y].bg_far_y=tile_word(0xe92)&511;
   f.rows[y].bg_y=v.pad;   // r025: near layer rows on the low-nibble plane (R13), far rows on R15
+  if(show_static)f.rows[y].bg_far_y=0;   // r030: both planes at row 0
   // r021: the original draws the road over the tile layers on every line where either
   // road is enabled, and shows the tiles (over the line colour) only where both are off.
   // So the background graphic page is shown only on lines without road BG.
-  f.rows[y].control=(show_background&&f.mode[y]==0)?0x004f:0x004c; // r022: mode 0 = line without road
+  f.rows[y].control=((show_background||show_static)&&f.mode[y]==0)?0x004f:0x004c; // r022: mode 0 = line without road
  }
  v.car.count=v.car.patterns=v.car.palettes=v.car.overflow=v.car.line_max=v.car.text_mode=0;
  if(visual_mode&2)build_car(v.car,pal);
@@ -1298,6 +1434,17 @@ void visuals_preview(const RoadFrame&f,uint16_t*out){
 #endif
 }
 static void visuals_preview_body(const RoadFrame&f,uint16_t*out){
+ if(f.visual.flags&4){   // r030: the 8-bit picture
+#ifndef OR_X68K
+  static uint16_t sref[320*224];const bool check=std::getenv("STAGE1_CHECK_VISUALS")!=0;
+  if(check){memset(sref,0,sizeof sref);video.tile_layer->update_tile_values();video.tile_layer->render_tile_layer_reference(sref,1,0);video.tile_layer->render_tile_layer_reference(sref,0,0);}
+  for(int y=0;y<224;y++)for(int x=0;x<320;x++){
+   const unsigned s=background_ring[y*512+x];
+   if(check){const unsigned e=sref[y*320+x];if(bool(e)!=bool(s)||(e&&opaque_colour(background_palette[e&8191])!=static_colour[s])){fprintf(stderr,"STATIC PICTURE FAIL x=%d y=%d\n",x,y);std::exit(8);}}
+   if(s&&(f.rows[y].control&3)==3)out[y*320+x]=static_colour[s];
+  }
+#endif
+ }else
  if((f.visual.flags&1)&&background_ready){
 #ifndef OR_X68K
   static uint16_t reference[320*224];
@@ -1370,25 +1517,27 @@ void visuals_selftest(){puts("BACKGROUND SOURCE CHECK ready");}
 #endif
 
 void visuals_print(){
- printf("R027 HUD frames=%lu cells avg=%lu max=%u full=%lu bands_max=%u approx=%lu us total=%lu\n",(unsigned long)hud_frames,(unsigned long)(hud_frames?hud_cells_total/hud_frames:0),hud_cells_peak,(unsigned long)hud_full_total,hud_bands_peak,(unsigned long)hud_approx_total,(unsigned long)(hud_fine_total*50UL));
+ report_printf("R027 HUD frames=%lu cells avg=%lu max=%u full=%lu bands_max=%u approx=%lu us total=%lu\n",(unsigned long)hud_frames,(unsigned long)(hud_frames?hud_cells_total/hud_frames:0),hud_cells_peak,(unsigned long)hud_full_total,hud_bands_peak,(unsigned long)hud_approx_total,(unsigned long)(hud_fine_total*50UL));
 #ifndef OR_X68K
- printf("R027 HUD pixels total=%llu approx=%llu\n",(unsigned long long)hud_pixels_total,(unsigned long long)hud_pixels_approx);
+ report_printf("R027 HUD pixels total=%llu approx=%llu\n",(unsigned long long)hud_pixels_total,(unsigned long long)hud_pixels_approx);
 #endif
- printf("R026 PHASES us capture=%lu colours=%lu tiles=%lu rest=%lu\n",(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_colour*50UL),(unsigned long)(scenery_fine_tiles*50UL),(unsigned long)((scenery_fine_total-scenery_fine_capture-scenery_fine_colour-scenery_fine_tiles)*50UL));
- printf("R026 DIAG entries=%lu off=%lu hidden=%lu priority=%lu car=%lu passed=%lu frames_rows=%lu count=%u\n",(unsigned long)scenery_diag[0],(unsigned long)scenery_diag[1],(unsigned long)scenery_diag[2],(unsigned long)scenery_diag[3],(unsigned long)scenery_diag[4],(unsigned long)scenery_diag[5],(unsigned long)scenery_diag[6],(unsigned)osprites.sprite_count);
- printf("R026 SCENERY frames=%lu sprites avg=%lu max=%u dropped=%lu car_dropped=%lu shared=%lu reused=%lu bank_drops=%lu blocks_max=%u line_longs_max=%u overflow=%lu us total=%lu capture=%lu max=%lu\n",(unsigned long)scenery_frames,(unsigned long)(scenery_frames?scenery_count_total/scenery_frames:0),scenery_peak,(unsigned long)scenery_dropped_total,(unsigned long)scenery_car_dropped,(unsigned long)scenery_shared_total,(unsigned long)scenery_reused_total,(unsigned long)scenery_bank_drops,scenery_block_peak,scenery_line_peak,(unsigned long)scenery_overflow,(unsigned long)(scenery_fine_total*50UL),(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_max*50UL));
+ report_printf("R026 PHASES us capture=%lu colours=%lu tiles=%lu rest=%lu\n",(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_colour*50UL),(unsigned long)(scenery_fine_tiles*50UL),(unsigned long)((scenery_fine_total-scenery_fine_capture-scenery_fine_colour-scenery_fine_tiles)*50UL));
+ report_printf("R026 DIAG entries=%lu off=%lu hidden=%lu priority=%lu car=%lu passed=%lu frames_rows=%lu count=%u\n",(unsigned long)scenery_diag[0],(unsigned long)scenery_diag[1],(unsigned long)scenery_diag[2],(unsigned long)scenery_diag[3],(unsigned long)scenery_diag[4],(unsigned long)scenery_diag[5],(unsigned long)scenery_diag[6],(unsigned)osprites.sprite_count);
+ report_printf("R026 SCENERY frames=%lu sprites avg=%lu max=%u dropped=%lu car_dropped=%lu shared=%lu reused=%lu bank_drops=%lu blocks_max=%u line_longs_max=%u overflow=%lu us total=%lu capture=%lu max=%lu\n",(unsigned long)scenery_frames,(unsigned long)(scenery_frames?scenery_count_total/scenery_frames:0),scenery_peak,(unsigned long)scenery_dropped_total,(unsigned long)scenery_car_dropped,(unsigned long)scenery_shared_total,(unsigned long)scenery_reused_total,(unsigned long)scenery_bank_drops,scenery_block_peak,scenery_line_peak,(unsigned long)scenery_overflow,(unsigned long)(scenery_fine_total*50UL),(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_max*50UL));
 #ifndef OR_X68K
- printf("R026 SCENERY pixels total=%llu dropped=%llu shadow_undarkened=%llu\n",(unsigned long long)scenery_pixels_total,(unsigned long long)scenery_dropped_pixels,(unsigned long long)scenery_shadow_pixels);
+ report_printf("R026 SCENERY pixels total=%llu dropped=%llu shadow_undarkened=%llu\n",(unsigned long long)scenery_pixels_total,(unsigned long long)scenery_dropped_pixels,(unsigned long long)scenery_shadow_pixels);
 #endif
 #ifndef OR_X68K
  scenery_print();
 #endif
 #ifdef OR_X68K
- printf("R025 BG nibble planes columns near=%lu far=%lu rows near=%lu far=%lu\n",(unsigned long)ring_column_count[0],(unsigned long)ring_column_count[1],(unsigned long)ring_row_count[0],(unsigned long)ring_row_count[1]);
+ report_printf("R025 BG nibble planes columns near=%lu far=%lu rows near=%lu far=%lu\n",(unsigned long)ring_column_count[0],(unsigned long)ring_column_count[1],(unsigned long)ring_row_count[0],(unsigned long)ring_row_count[1]);
 #endif
 #ifdef OR_X68K
- printf("R024 BG page_decodes=%lu decode_us=%lu layer_updates=%lu remaps=%lu refreshes=%lu update_us total=%lu max=%lu visible_refresh_us total=%lu max=%lu dirty_left=%u\n",(unsigned long)page_decodes,(unsigned long)(page_decode_fine*50UL),(unsigned long)layer_updates,(unsigned long)layer_remaps,(unsigned long)dirty_refreshes,(unsigned long)(rebuild_fine_total*50UL),(unsigned long)(rebuild_fine_max*50UL),(unsigned long)(full_stream_fine_total*50UL),(unsigned long)(full_stream_fine_max*50UL),bg_ring[0].dirty_count+bg_ring[1].dirty_count);
- printf("R020 CAR us total=%lu capture=%lu direct=%lu max=%lu cache hits=%lu misses=%lu stores=%lu rejects=%lu entries=%u bytes=%lu\n",(unsigned long)(car_fine_total*50UL),(unsigned long)(car_fine_capture*50UL),(unsigned long)(car_fine_direct*50UL),(unsigned long)(car_fine_max*50UL),(unsigned long)car_cache_hits,(unsigned long)car_cache_misses,(unsigned long)car_cache_stores,(unsigned long)car_cache_rejects,car_cache_entries,(unsigned long)car_cache_bytes);
- printf("R019 COMMIT calls=%lu us avg=%lu max=%lu\n",(unsigned long)commit_calls,(unsigned long)(commit_calls?commit_counts_total*50UL/commit_calls:0),(unsigned long)(commit_counts_max*50UL));
+ report_printf("R024 BG page_decodes=%lu decode_us=%lu layer_updates=%lu remaps=%lu refreshes=%lu update_us total=%lu max=%lu visible_refresh_us total=%lu max=%lu dirty_left=%u\n",(unsigned long)page_decodes,(unsigned long)(page_decode_fine*50UL),(unsigned long)layer_updates,(unsigned long)layer_remaps,(unsigned long)dirty_refreshes,(unsigned long)(rebuild_fine_total*50UL),(unsigned long)(rebuild_fine_max*50UL),(unsigned long)(full_stream_fine_total*50UL),(unsigned long)(full_stream_fine_max*50UL),bg_ring[0].dirty_count+bg_ring[1].dirty_count);
+ report_printf("R020 CAR us total=%lu capture=%lu direct=%lu max=%lu cache hits=%lu misses=%lu stores=%lu rejects=%lu entries=%u bytes=%lu\n",(unsigned long)(car_fine_total*50UL),(unsigned long)(car_fine_capture*50UL),(unsigned long)(car_fine_direct*50UL),(unsigned long)(car_fine_max*50UL),(unsigned long)car_cache_hits,(unsigned long)car_cache_misses,(unsigned long)car_cache_stores,(unsigned long)car_cache_rejects,car_cache_entries,(unsigned long)car_cache_bytes);
+ report_printf("R019 COMMIT calls=%lu us avg=%lu max=%lu\n",(unsigned long)commit_calls,(unsigned long)(commit_calls?commit_counts_total*50UL/commit_calls:0),(unsigned long)(commit_counts_max*50UL));
 #endif
- printf("BACKGROUND source_frames=%lu rebuilds=%lu capacity_waits=%lu recomposed_rows=%lu\n",(unsigned long)background_source_frames,(unsigned long)background_rebuilds,(unsigned long)background_capacity_waits,(unsigned long)background_recomposed_rows);printf("BG TRANSFER far_checks=%lu data_errors=%lu palette_errors=%lu\n",(unsigned long)background_far_checks,(unsigned long)background_data_errors,(unsigned long)background_palette_errors);}
+ report_printf("R030 SCENERY REUSE frames=%lu of %lu\n",(unsigned long)scenery_reuse_frames,(unsigned long)scenery_frames);
+ report_printf("R030 STATIC PICTURE frames=%lu composes=%lu colours=%u\n",(unsigned long)static_frames,(unsigned long)static_composes,static_ncol);
+ report_printf("BACKGROUND source_frames=%lu rebuilds=%lu capacity_waits=%lu recomposed_rows=%lu\n",(unsigned long)background_source_frames,(unsigned long)background_rebuilds,(unsigned long)background_capacity_waits,(unsigned long)background_recomposed_rows);report_printf("BG TRANSFER far_checks=%lu data_errors=%lu palette_errors=%lu\n",(unsigned long)background_far_checks,(unsigned long)background_data_errors,(unsigned long)background_palette_errors);}

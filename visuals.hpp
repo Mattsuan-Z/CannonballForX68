@@ -12,6 +12,7 @@ bool visuals_load();
 void visuals_build(RoadFrame&,const uint16_t*);
 void visuals_preview(const RoadFrame&,uint16_t*);
 void visuals_native_init();
+void visuals_handoff(RoadFrame&f);   // r029
 void visuals_stream(const RoadFrame&);
 extern "C" void visuals_native_commit(const RoadFrame*);
 

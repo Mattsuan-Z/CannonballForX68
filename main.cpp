@@ -7,6 +7,7 @@
 #include "visuals.hpp"
 #include <cstdlib>
 #include "cbx68_test.hpp"
+#include "report_pager.hpp"   // r028: the end figures stop at each full screen (X68000)
 static void snapshot(const char* name) {
     if (!g_pixels) return;
     FILE* f=fopen(name,"wb"); if(!f)return;
@@ -41,16 +42,25 @@ int main(int argc,char**argv) {
 #ifdef OR_X68K
  max_frames=argc>1?atoi(argv[1]):0;
 #endif
-    puts("Cannonball for x68 v0.1 - unofficial X68000 port by Mattsuan-Z@ColtMaz");
+    puts("Cannonball for x68 v0.2 - unofficial X68000 port by Mattsuan-Z@ColtMaz");
     puts("Based on Cannonball (OutRun engine) by Chris White and the Cannonball team");
     puts("OutRun is a trademark of SEGA. Not affiliated with SEGA or the Cannonball team. ROMs not included.");fflush(stdout);
     // Cannonball for x68: "CBX68 TEST" = display test without ROMs (PC: 2nd argument = frames)
+#ifdef OR_X68K
+    // r029: VSYNC (default) / CLOCK / HZ60 anywhere after the first argument choose the frame pacing (native_platform.hpp)
+    for(int a=2;a<argc;a++){char w[8]={0};for(int k=0;k<7&&argv[a][k];k++)w[k]=char(argv[a][k]|32);
+     if(!strcmp(w,"vsync"))native_vsync_pace=true;
+     if(!strcmp(w,"clock"))native_vsync_pace=false;
+     if(!strcmp(w,"hz60")){native_hz60=true;native_vsync_pace=true;}}
+#endif
     cbx68_test=argc>1&&(argv[1][0]|32)=='t'&&(argv[1][1]|32)=='e'&&(argv[1][2]|32)=='s'&&(argv[1][3]|32)=='t'&&!argv[1][4];
     if(cbx68_test){
+     // r028: CBX68 TEST HEAVY (PC: stage1 test FRAMES heavy) = more and bigger shapes, more colours
+     for(int a=2;a<argc;a++)if((argv[a][0]|32)=='h'&&(argv[a][1]|32)=='e'&&(argv[a][2]|32)=='a'&&(argv[a][3]|32)=='v'&&(argv[a][4]|32)=='y'&&!argv[a][5])cbx68_test_heavy=true;
 #ifdef OR_X68K
      max_frames=0;
 #else
-     max_frames=argc>2?atoi(argv[2]):600;
+     max_frames=argc>2&&argv[2][0]>='0'&&argv[2][0]<='9'?atoi(argv[2]):600;
 #endif
      argc=1;}
     bool road_demo=argc>3&&strcmp(argv[3],"manual");bool road_right=road_demo&&!strcmp(argv[3],"right");
@@ -174,6 +184,7 @@ int main(int argc,char**argv) {
                 if(c=='3')visual_mode=1;
                 if(c=='4')visual_mode=3;
                 if(c=='v'||c=='V')render_schedule.draw30=!render_schedule.draw30;
+                if(c=='l'||c=='L')cbx68_test_heavy=!cbx68_test_heavy;   // r028: light / heavy load
             }
             if(quit)break;
         }
@@ -278,19 +289,25 @@ int main(int argc,char**argv) {
             static RoadFrame road_frame;
 #endif
 #ifdef OR_X68K
+            // r029: build first (into the free third frame), then wait until the frame before has
+            // been taken by the vertical blank, then write video memory (road page rows, text).
             {unsigned vm=visual_mode&3;uint32_t t0=platform_fine_clock();
-            road_build(hwroad,display_palette,road_frame);uint32_t tb=platform_fine_clock();road_stream(road_frame);
-            uint32_t t1=platform_fine_clock();part_road_stream[vm]+=t1-tb;
+            road_build(hwroad,display_palette,road_frame);uint32_t ta=platform_fine_clock();
             visuals_build(road_frame,display_palette);
             uint32_t t2=platform_fine_clock();
+            platform_road_handoff();visuals_handoff(road_frame);
+            uint32_t tb=platform_fine_clock();
+            road_stream(road_frame);uint32_t tc=platform_fine_clock();part_road_stream[vm]+=tc-tb;
             visuals_stream(road_frame);
             uint32_t t3=platform_fine_clock();
-            part_road[vm]+=t1-t0;part_build[vm]+=t2-t1;part_stream[vm]+=t3-t2;
-            if(t1-t0>part_max[vm][0])part_max[vm][0]=t1-t0;if(t2-t1>part_max[vm][1])part_max[vm][1]=t2-t1;if(t3-t2>part_max[vm][2])part_max[vm][2]=t3-t2;}
+            const uint32_t road_t=(ta-t0)+(tc-tb);
+            part_road[vm]+=road_t;part_build[vm]+=t2-ta;part_stream[vm]+=t3-tc;
+            if(road_t>part_max[vm][0])part_max[vm][0]=road_t;if(t2-ta>part_max[vm][1])part_max[vm][1]=t2-ta;if(t3-tc>part_max[vm][2])part_max[vm][2]=t3-tc;}
             if(road_dump_requested){road_dump_requested=false;road_dump(road_frame,frame);}
 #else
-            road_build(hwroad,display_palette,road_frame);road_stream(road_frame);
-            visuals_build(road_frame,display_palette);
+            road_build(hwroad,display_palette,road_frame);   // r029: same order as the X68000
+            visuals_build(road_frame,display_palette);visuals_handoff(road_frame);
+            road_stream(road_frame);
             visuals_stream(road_frame);
 #endif
 #ifdef OR_X68K
@@ -299,6 +316,9 @@ int main(int argc,char**argv) {
             native_phase_record(2,phase_start);
 #else
             road_preview(road_frame,video.pixels);visuals_preview(road_frame,video.pixels);g_pixels=video.pixels;
+            {// r028 PC check: digest of every drawn picture (compared with the v0.1 code)
+             static uint64_t dg=1469598103934665603ULL;static unsigned dn=0;for(int i=0;i<320*224;i++){dg^=video.pixels[i];dg*=1099511628211ULL;}++dn;
+             if(dn%50==0||getenv("R028_DIGEST_ALL"))printf("R028 DIGEST draw=%u frame=%d %016llx\n",dn,frame,(unsigned long long)dg);}
             timeline_render(frame);
             if(frame==299||frame==599||frame==999||frame%1000==999){char n[48];snprintf(n,sizeof n,"road_%05d.ppm",frame);snapshot(n);}
 #endif
@@ -318,29 +338,29 @@ int main(int argc,char**argv) {
     #ifdef OR_X68K
     platform_exit();
 #endif
-    printf("base_steps=%d ingame=%d state=%d stage=%d pos=%x speed=%x car_x=%d\n",actual_frames,ingame,outrun.game_state,ostats.cur_stage,oroad.road_pos>>16,oinitengine.car_increment>>16,oinitengine.car_x_pos);
+    report_printf("base_steps=%d ingame=%d state=%d stage=%d pos=%x speed=%x car_x=%d\n",actual_frames,ingame,outrun.game_state,ostats.cur_stage,oroad.road_pos>>16,oinitengine.car_increment>>16,oinitengine.car_x_pos);
 #ifndef OR_X68K
     timeline_close();
 
     if(getenv("STAGE1_SPRITE_STATS")){FILE* f=fopen(getenv("STAGE1_SPRITE_STATS"),"w");video.sprite_layer->print_sprite_work(f);if(f)fclose(f);}
     const char* trace_root=getenv("STAGE1_TRACE");
     if(trace_root){std::string profile_path=std::string(trace_root)+".profile.txt";FILE* f=fopen(profile_path.c_str(),"w");draw_profile_print(f,true);if(f)fclose(f);}
-    printf("SCHEDULE steps=%u logic=%u draws=%u mode30_steps=%u mode60_steps=%u verified_renders=%u\n",render_schedule.steps[0]+render_schedule.steps[1],render_schedule.logic[0]+render_schedule.logic[1],render_schedule.draws[0]+render_schedule.draws[1],render_schedule.steps[0],render_schedule.steps[1],0U);
+    report_printf("SCHEDULE steps=%u logic=%u draws=%u mode30_steps=%u mode60_steps=%u verified_renders=%u\n",render_schedule.steps[0]+render_schedule.steps[1],render_schedule.logic[0]+render_schedule.logic[1],render_schedule.draws[0]+render_schedule.draws[1],render_schedule.steps[0],render_schedule.steps[1],0U);
 #endif
-    printf("road_ctrl=%u split_state=%u horizon=%d curve=%d route=%d\n",unsigned(oroad.road_ctrl),unsigned(oinitengine.rd_split_state),int(oroad.horizon_y_bak),int(oinitengine.road_curve),int(oinitengine.route_selected));
-    printf("VISUAL road=%lu bg=%lu car=%lu both=%lu bg_columns=%lu car_frames=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)visual_frames[0],(unsigned long)visual_frames[1],(unsigned long)visual_frames[2],(unsigned long)visual_frames[3],(unsigned long)background_columns,(unsigned long)car_frames,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
-    printf("CAR TEXT frames=%lu\n",(unsigned long)car_text_frames);
+    report_printf("road_ctrl=%u split_state=%u horizon=%d curve=%d route=%d\n",unsigned(oroad.road_ctrl),unsigned(oinitengine.rd_split_state),int(oroad.horizon_y_bak),int(oinitengine.road_curve),int(oinitengine.route_selected));
+    report_printf("VISUAL road=%lu bg=%lu car=%lu both=%lu bg_columns=%lu car_frames=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)visual_frames[0],(unsigned long)visual_frames[1],(unsigned long)visual_frames[2],(unsigned long)visual_frames[3],(unsigned long)background_columns,(unsigned long)car_frames,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
+    report_printf("CAR TEXT frames=%lu\n",(unsigned long)car_text_frames);
 #ifdef OR_X68K
     {const char*names[4]={"ROAD","BG","CAR","BOTH"};
      for(unsigned m=0;m<4;m++){uint32_t d=native_visual_draws[m];if(!d)continue;
-      printf("R020 TABLE %s draws=%lu us/draw road=%lu visuals_build=%lu stream=%lu max_us road=%lu build=%lu stream=%lu\n",names[m],(unsigned long)d,(unsigned long)(part_road[m]*50UL/d),(unsigned long)(part_build[m]*50UL/d),(unsigned long)(part_stream[m]*50UL/d),(unsigned long)(part_max[m][0]*50UL),(unsigned long)(part_max[m][1]*50UL),(unsigned long)(part_max[m][2]*50UL));}
-     for(unsigned m=0;m<4;m++)if(native_visual_draws[m])printf("R024 ROAD %s road_stream us/draw=%lu\n",names[m],(unsigned long)(part_road_stream[m]*50UL/native_visual_draws[m]));
-     printf("R020 DUMPS files=%u\n",road_dump_count);}
+      report_printf("R020 TABLE %s draws=%lu us/draw road=%lu visuals_build=%lu stream=%lu max_us road=%lu build=%lu stream=%lu\n",names[m],(unsigned long)d,(unsigned long)(part_road[m]*50UL/d),(unsigned long)(part_build[m]*50UL/d),(unsigned long)(part_stream[m]*50UL/d),(unsigned long)(part_max[m][0]*50UL),(unsigned long)(part_max[m][1]*50UL),(unsigned long)(part_max[m][2]*50UL));}
+     for(unsigned m=0;m<4;m++)if(native_visual_draws[m])report_printf("R024 ROAD %s road_stream us/draw=%lu\n",names[m],(unsigned long)(part_road_stream[m]*50UL/native_visual_draws[m]));
+     report_printf("R020 DUMPS files=%u\n",road_dump_count);}
 #endif
     visuals_print();
 #ifdef OR_X68K
     native_road_memory_report();
 #endif
-    if(cbx68_test){puts("DISPLAY TEST END");return 0;}
+    if(cbx68_test){report_printf("DISPLAY TEST END load=%s\n",cbx68_test_heavy?"HEAVY":"LIGHT");return 0;}
     return ingame<0?2:0;
 }

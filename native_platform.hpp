@@ -5,6 +5,7 @@
 #include <x68k/iocs.h>
 #include <stdint.h>
 #include <cstdio>
+#include "report_pager.hpp"
 #include "road_bridge.hpp"
 #include "visuals.hpp"
 #define HW16(a) (*(volatile uint16_t*)(a))
@@ -16,7 +17,15 @@ RoadRow* volatile road_pending=0;
 RoadRow* volatile road_scan=0;
 volatile uint32_t road_vblanks=0,road_shown=0,road_irq_count=0;
 }
-static RoadFrame road_frames[2];
+static RoadFrame road_frames[3];   // r029: one shown, one waiting for the next vertical blank, one being built
+// r029: frame pacing (Masa compared the three on XM6 and chose VSYNC, 2026-11-08):
+//  VSYNC (default): one picture every 2 screen refreshes (55.46 Hz): even, 27.7 pictures a
+//                   second; the game runs about 8% slower than real time.
+//  CLOCK (argument): 30 pictures a second by the 1/100 s clock; now and then a picture is shown
+//                   for one refresh only (a hitch every few seconds).
+//  HZ60 (argument): 60 Hz screen (vertical total 525 lines instead of 568), 2 refreshes a picture.
+static bool native_vsync_pace=true,native_hz60=false;
+static uint32_t native_idle_waits=0;   // r028: number of STOP waits (end report)
 static int native_old_mode,native_ssp;
 static uint32_t native_started,native_frames;
 static uint32_t native_phase_cs[4],native_mode_cs[2][4];
@@ -59,7 +68,21 @@ static void native_phase_record(unsigned phase,uint32_t start){native_fine_recor
 static uint32_t native_elapsed(){uint32_t n=native_clock();return n>=native_started?n-native_started:8640000UL-native_started+n;}
 static void platform_present(uint16_t*,uint32_t*){}
 static bool native_key(int sc){return (_iocs_bitsns(sc>>3)&(1<<(sc&7)))!=0;}
-static RoadFrame& platform_road_back(){uint32_t start=native_clock();while(road_pending){if(native_clock()-start>200){native_irq_failed=true;road_pending=0;break;}}if(native_elapsed()>200&&!road_irq_count)native_irq_failed=true;return road_active==road_frames[0].rows?road_frames[1]:road_frames[0];}
+// r029: the frame to build into is the one that is neither shown nor waiting to be shown, so
+// building starts at once. Only the video memory writes (road page rows, text plane) wait, in
+// platform_road_handoff(), until the waiting frame has been taken (its row set is then free).
+static RoadFrame& platform_road_back(){
+ if(native_elapsed()>200&&!road_irq_count)native_irq_failed=true;
+ unsigned short sr=mask_irqs();RoadRow*a=road_active,*w=road_pending;restore_irqs(sr);
+ for(unsigned k=0;k<3;k++)if(road_frames[k].rows!=a&&road_frames[k].rows!=w)return road_frames[k];
+ return road_frames[0];   // not reached: three frames, at most two in use
+}
+static uint32_t native_handoff_fine=0,native_handoff_waits=0,native_handoff_calls=0;
+static void platform_road_handoff(){
+ uint32_t start=native_clock(),t0=platform_fine_clock();++native_handoff_calls;
+ while(road_pending){if(native_clock()-start>200){native_irq_failed=true;road_pending=0;break;}native_idle_waits++;native_handoff_waits++;__asm__ volatile("stop #0x2000":::"memory");}
+ native_handoff_fine+=platform_fine_clock()-t0;
+}
 static void platform_road_submit(RoadFrame&f){__asm__ volatile("":::"memory");road_pending=f.rows;++native_frames;++native_visual_draws[native_measuring_visual];}
 static void platform_init(){
  native_old_mode=_iocs_crtmod(-1);native_ssp=_iocs_b_super(0);for(unsigned i=0;i<16;i++)saved_text_palette[i]=HW16(0xe82200UL+i*2);_iocs_crtmod(10);_iocs_b_curoff();_iocs_sp_init();_iocs_sp_off();
@@ -72,6 +95,7 @@ static void platform_init(){
  visuals_native_init();
  HW16(0xe80002)=2;HW16(0xe80004)=4;HW16(0xe80006)=44;
  HW16(0xeb080c)=8;HW16(0xe8000c)=72;HW16(0xe8000e)=520;HW16(0xeb080e)=72;
+ if(native_hz60)HW16(0xe80008)=524;   // r029 HZ60: R04 vertical total 525 lines: 31.5 kHz / 525 = 60 Hz (display lines 72..520 unchanged)
  HW16(0xe80012)=1023;HW16(0xe82400)=1;HW16(0xe82500)=0x06e4;HW16(0xe82600)=0x004f;
  for(unsigned a=0xe80014;a<=0xe80026;a+=2)HW16(a)=0;
  road_build(hwroad,display_palette,road_frames[0]);road_stream(road_frames[0]);road_active=road_frames[0].rows;
@@ -91,13 +115,26 @@ static void platform_sync(int frame){
  static uint32_t deadline=0;static bool previous30=true;
  bool mode30=render_schedule.draw30;
  if(mode30&&!(frame&1))return;
+ if(native_vsync_pace){   // r029: count screen refreshes instead of the clock
+  static uint32_t vdeadline=0;static bool vprevious30=true;static bool vstarted=false;
+  const uint32_t v=road_vblanks;
+  if(!vstarted||vprevious30!=mode30){vdeadline=v;vprevious30=mode30;vstarted=true;}
+  vdeadline+=mode30?2:1;
+  {unsigned m=native_measuring_visual;if(fine_draw_work>fine_work_max[m])fine_work_max[m]=fine_draw_work;fine_draw_work=0;
+   if(v>=vdeadline){++fine_overruns[m];fine_late[m]+=(v-vdeadline+1)*(native_hz60?100u:108u);}}
+  if(v>=vdeadline){vdeadline=v;return;}
+  while(road_vblanks<vdeadline){native_idle_waits++;__asm__ volatile("stop #0x2000":::"memory");}
+  return;
+ }
  uint32_t now=native_elapsed()*60UL;
  if(previous30!=mode30){deadline=now;previous30=mode30;}
  deadline+=mode30?200:100;
  {unsigned m=native_measuring_visual;if(fine_draw_work>fine_work_max[m])fine_work_max[m]=fine_draw_work;fine_draw_work=0;
   if(now>deadline){++fine_overruns[m];fine_late[m]+=now-deadline;}}
  if(now>deadline){deadline=now;return;}
- while(native_elapsed()*60UL<deadline){}
+ // r028: wait with STOP (the CPU sleeps until the next interrupt: raster line, vertical blank or the
+ // 1/100 s clock that native_elapsed() reads), instead of a busy loop. Saves host CPU in emulators.
+ while(native_elapsed()*60UL<deadline){native_idle_waits++;__asm__ volatile("stop #0x2000":::"memory");}
 }
 static unsigned road_map_errors=0,road_pattern_errors=0,road_ground_errors=0;
 static void native_road_memory_check(){
@@ -114,7 +151,7 @@ static void native_road_memory_check(){
  }
  road_map_errors=maps;road_pattern_errors=patterns;road_ground_errors=ground;
 }
-static void native_road_memory_report(){ printf("ROAD MEMORY map_errors=%u pattern_errors=%u ground_errors=%u\n",road_map_errors,road_pattern_errors,road_ground_errors);}
+static void native_road_memory_report(){ report_printf("ROAD MEMORY map_errors=%u pattern_errors=%u ground_errors=%u\n",road_map_errors,road_pattern_errors,road_ground_errors);}
 static void platform_exit(){
  uint32_t t=native_elapsed();unsigned short sr=mask_irqs();
  HW8(0xe88019)=0;HW16(0xe80012)=1023;HW16(0xeb0808)=0;
@@ -129,26 +166,30 @@ static void platform_exit(){
  // r027b: the score etc. use all 4 text planes; the console clears only its own
  for(unsigned p=0;p<4;p++)for(unsigned i=0;i<512*64;i++)HW16(0xe00000UL+p*0x20000UL+i*2)=0;
  restore_irqs(sr);_iocs_crtmod(native_old_mode);_iocs_sp_off();_iocs_b_curon();for(unsigned i=0;i<16;i++)HW16(0xe82200UL+i*2)=saved_text_palette[i];_iocs_b_clr_al();_iocs_b_locate(0,0);if(native_ssp>0)_iocs_b_super(native_ssp);
+ report_pager_start();   // r028: stop at each full screen
 
  const char* labels[]={"ROAD","BG","CAR","BOTH"};
  for(unsigned m=0;m<4;m++){
   uint32_t total=0;for(unsigned k=0;k<4;k++)total+=native_visual_cs[m][k];
-  printf("MODE %s steps=%lu draws=%lu logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu fps_x1000=%lu\n",labels[m],(unsigned long)native_visual_steps[m],(unsigned long)native_visual_draws[m],(unsigned long)native_visual_cs[m][0],(unsigned long)native_visual_cs[m][1],(unsigned long)native_visual_cs[m][2],(unsigned long)native_visual_cs[m][3],total?native_visual_draws[m]*100000UL/total:0);
+  report_printf("MODE %s steps=%lu draws=%lu logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu fps_x1000=%lu\n",labels[m],(unsigned long)native_visual_steps[m],(unsigned long)native_visual_draws[m],(unsigned long)native_visual_cs[m][0],(unsigned long)native_visual_cs[m][1],(unsigned long)native_visual_cs[m][2],(unsigned long)native_visual_cs[m][3],total?native_visual_draws[m]*100000UL/total:0);
  }
- if(native_irq_failed)puts("ROAD INTERRUPT TIMEOUT - report the counters below.");
- printf("ROAD BRIDGE r027c 320x224 BG/raster\nframes=%lu shown=%lu cs=%lu fps_x1000=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,t?native_frames*100000UL/t:0);
- printf("logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\n",(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3]);
- printf("visual_mode=%u road=%lu bg=%lu car=%lu both=%lu\n",visual_mode,(unsigned long)visual_frames[0],(unsigned long)visual_frames[1],(unsigned long)visual_frames[2],(unsigned long)visual_frames[3]);
- printf("bg_columns=%lu car_frames=%lu car_tiles=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_tiles_total,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
- printf("car_text_frames=%lu\n",(unsigned long)car_text_frames);
- printf("shown_x1000=%lu\n",t?road_shown*100000UL/t:0);
- printf("vblanks=%lu raster_irqs=%lu\n",(unsigned long)road_vblanks,(unsigned long)road_irq_count);
+ if(native_irq_failed)report_puts("ROAD INTERRUPT TIMEOUT - report the counters below.");
+ report_printf("R028 IDLE stop_waits=%lu\n",(unsigned long)native_idle_waits);
+ report_printf("R029 PACE %s screen=%s\n",native_vsync_pace?"VSYNC (2 refreshes a picture)":"CLOCK (30 a second)",native_hz60?"60 Hz":"55.46 Hz");
+ report_printf("R029 HANDOFF calls=%lu stop_waits=%lu us/draw=%lu\n",(unsigned long)native_handoff_calls,(unsigned long)native_handoff_waits,(unsigned long)(native_handoff_calls?native_handoff_fine*50UL/native_handoff_calls:0));
+ report_printf("ROAD BRIDGE r030 320x224 BG/raster\nframes=%lu shown=%lu cs=%lu fps_x1000=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,t?native_frames*100000UL/t:0);
+ report_printf("logic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\n",(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3]);
+ report_printf("visual_mode=%u road=%lu bg=%lu car=%lu both=%lu\n",visual_mode,(unsigned long)visual_frames[0],(unsigned long)visual_frames[1],(unsigned long)visual_frames[2],(unsigned long)visual_frames[3]);
+ report_printf("bg_columns=%lu car_frames=%lu car_tiles=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_tiles_total,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
+ report_printf("car_text_frames=%lu\n",(unsigned long)car_text_frames);
+ report_printf("shown_x1000=%lu\n",t?road_shown*100000UL/t:0);
+ report_printf("vblanks=%lu raster_irqs=%lu\n",(unsigned long)road_vblanks,(unsigned long)road_irq_count);
  {
   uint32_t fine_total=fine_last-fine_start;
-  printf("FINE r024 unit=50us total=%lu cs_equiv=%lu tcdr=%u..%u backsteps=%lu retries=%lu\n",(unsigned long)fine_total,(unsigned long)(fine_total/200),fine_tmin,fine_tmax,(unsigned long)fine_backsteps,(unsigned long)fine_retries);
+  report_printf("FINE r024 unit=50us total=%lu cs_equiv=%lu tcdr=%u..%u backsteps=%lu retries=%lu\n",(unsigned long)fine_total,(unsigned long)(fine_total/200),fine_tmin,fine_tmax,(unsigned long)fine_backsteps,(unsigned long)fine_retries);
   for(unsigned m=0;m<4;m++){
    uint32_t d=native_visual_draws[m];if(!d)continue;
-   printf("FINE %s draws=%lu us/draw logic=%lu table=%lu publish=%lu wait=%lu max_us table=%lu work=%lu overruns=%lu late_cs=%lu\n",labels[m],(unsigned long)d,
+   report_printf("FINE %s draws=%lu us/draw logic=%lu table=%lu publish=%lu wait=%lu max_us table=%lu work=%lu overruns=%lu late_cs=%lu\n",labels[m],(unsigned long)d,
     (unsigned long)(fine_phase[m][0]*50UL/d),(unsigned long)(fine_phase[m][1]*50UL/d),(unsigned long)(fine_phase[m][2]*50UL/d),(unsigned long)(fine_phase[m][3]*50UL/d),
     (unsigned long)(fine_phase_max[m][1]*50UL),(unsigned long)(fine_work_max[m]*50UL),(unsigned long)fine_overruns[m],(unsigned long)(fine_late[m]/60));
   }
