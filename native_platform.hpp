@@ -185,10 +185,16 @@ static void platform_init(){
   uint32_t n=0;unsigned steps=0;
   while(steps<40&&n<400000UL){for(unsigned j=0;j<32;j++)q[j]=0;n+=32;t=HW8(0xe88023);steps=(t0+200-t)%200;}
   pcg_long_ns=steps?steps*50000UL/n:0;
-  if(pcg_long_ns)visuals_set_line_budget(unsigned(60000UL/pcg_long_ns));
-  // r031l: light mode on a slow bus (XEiJ 060turbo: 1.0 us a long without wait cycles, 1.9 us with
-  // them, as on the real board). Arguments LIGHT / FULL choose it by hand.
-  visuals_set_light(native_light_mode<0?pcg_long_ns>=1400:native_light_mode>0);}
+  // #62: 45 us, not 60. On the 060turbo's bus (XEiJ with wait cycles: 1.8 us a long, 32 longs a
+  // line) the jobs took nearly every line period, and in the pillar part of stage 2 the work of
+  // the vertical blank did not end before the next one (588 of 3926 blanks): the scenery of those
+  // refreshes was cut off and showed wrong patterns. With 24 longs none is cut off, and 6.5 tiles
+  // a picture are left out.
+  if(pcg_long_ns)visuals_set_line_budget(unsigned(45000UL/pcg_long_ns));
+  // r031l: light mode (a frame keeps only as many tiles as there are patterns, plus a few) only by
+  // the argument LIGHT. #62: on the 060turbo it left out most of the pillars of stage 2 and the
+  // cars among them; drawing all of them and showing fewer pictures (frame skip) looks better.
+  visuals_set_light(native_light_mode>0);}
  restore_irqs(sr);
  native_started=native_clock();native_frames=0;
  fine_start=fine_phase_start=platform_fine_clock();
