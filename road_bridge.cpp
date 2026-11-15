@@ -204,6 +204,18 @@ void road_build(const HWRoad&r,const uint16_t*pal,RoadFrame&f){
  for(unsigned y=1;y<223;y++){RoadRow&row=f.rows[y];const RoadRow&up=f.rows[y-1],&down=f.rows[y+1];   // (downwards: the rows inside a run take the value of its first row)
   if(!(row.road_enable&1)&&!(up.road_enable&1)&&!(down.road_enable&1))row.bg0=up.bg0;
   if(!(row.road_enable&8)&&!(up.road_enable&8)&&!(down.road_enable&8))row.bg1=up.bg1;}
+ // #56: the raster interrupt of a row runs on the last line of the row before, and on a fast
+ // machine its first writes are already shown on that line (XEiJ 060turbo: the BG scrolls and the
+ // graphic scroll; pix68k 75 MHz: the palettes as well). Where a row whose graphic page shows one
+ // colour (all five ground colours the same: road from the BG atlas, or no road) meets a row that
+ // shows a road line from the page, the one-colour row takes the graphic scroll and the page line
+ // of that neighbour: its own picture does not change (one colour whatever the page holds there),
+ // and whatever part of its writes comes a line early, the line shows the neighbour's road line,
+ // not a road line moved to scroll 0 or an old page row. (One-colour runs of two or more rows take
+ // the row below at their last row, so the next road row's early writes find its own line there.)
+ auto flat=[&](unsigned y){const RoadRow&r=f.rows[y];for(unsigned k=1;k<5;k++)if(r.ground[k]!=r.ground[0])return false;return true;};
+ for(unsigned y=1;y<224;y++)if(flat(y)&&!flat(y-1)&&f.gv_line[y-1]>=0){f.rows[y].gpage=f.rows[y-1].gpage;f.gv_line[y]=f.gv_line[y-1];}
+ for(int y=222;y>=1;y--)if(flat(y)&&flat(y-1)&&!flat(y+1)&&f.gv_line[y+1]>=0){f.rows[y].gpage=f.rows[y+1].gpage;f.gv_line[y]=f.gv_line[y+1];}
 }
 // After everything that changes the rows (road_build, visuals_build): see RoadFrame::row_changed.
 // CBX68_PROF: every row keeps its interrupt (the profiler takes one sample a line).
