@@ -1373,15 +1373,18 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
  // pattern on a slow bus) still gets placed. Returns the start line, or -1; what was charged is
  // kept in place_l/place_n for place_undo().
  static int16_t place_l[SCENERY_LINES];static uint8_t place_n[SCENERY_LINES];unsigned place_count=0;
+ // #62: the car's tiles may go over the budget (twice it) when they do not fit: there are few of
+ // them, and a car tile left out shows as a hole in the car. `cap` is the budget of the call.
+ unsigned cap=SCENERY_LINE_BUDGET;
  auto place=[&](int from,int z,unsigned need)->int{
-  int l=std::max(from,room);
-  while(l<=z&&line_load[l]>=SCENERY_LINE_BUDGET){if(l==room)room=l+1;++l;}
+  int l=cap==SCENERY_LINE_BUDGET?std::max(from,room):from;
+  while(l<=z&&line_load[l]>=cap){if(l==room&&cap==SCENERY_LINE_BUDGET)room=l+1;++l;}
   if(l>z)return -1;
-  unsigned room_sum=0;for(int k=l;k<=z&&room_sum<need;k++)if(line_load[k]<SCENERY_LINE_BUDGET)room_sum+=SCENERY_LINE_BUDGET-line_load[k];
+  unsigned room_sum=0;for(int k=l;k<=z&&room_sum<need;k++)if(line_load[k]<cap)room_sum+=cap-line_load[k];
   if(room_sum<need)return -1;
   place_count=0;unsigned rem=need;
-  for(int k=l;rem;k++){if(line_load[k]>=SCENERY_LINE_BUDGET)continue;
-   const unsigned f=std::min<unsigned>(SCENERY_LINE_BUDGET-line_load[k],rem);
+  for(int k=l;rem;k++){if(line_load[k]>=cap)continue;
+   const unsigned f=std::min<unsigned>(cap-line_load[k],rem);
    line_load[k]=uint16_t(line_load[k]+f);rem-=f;place_l[place_count]=int16_t(k);place_n[place_count++]=uint8_t(f);}
   return l;};
  auto place_undo=[&](const int16_t*pl,const uint8_t*pn,unsigned count){for(unsigned k=0;k<count;k++){line_load[pl[k]]=uint16_t(line_load[pl[k]]-pn[k]);if(pl[k]<room)room=pl[k];}};
@@ -1499,6 +1502,7 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
    for(unsigned q=0;q<2&&pn<0;q++){if(cand[q]<0)continue;
     diff_cost=34;const uint32_t m=SCENERY_DIFF?diff_mask(pcg_of(unsigned(p_content[cand[q]])),mine):0xffffffffu;const unsigned need=diff_cost;
     lp=place(16*(p_last[cand[q]]+1)+3,z,need);
+    if(lp<0&&is_car){cap=2*SCENERY_LINE_BUDGET;lp=place(16*(p_last[cand[q]]+1)+3,z,need);cap=SCENERY_LINE_BUDGET;}
     if(lp>=0){pn=cand[q];pre=true;from_q=int(q);pmask=m;pneed=need;}}
    if(pn<0){if(sre)place_undo(s_pl,s_pn,s_count);drop();continue;}
   }
