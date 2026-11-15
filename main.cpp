@@ -282,6 +282,9 @@ int main(int argc,char**argv) {
             // credit/start stays for measured runs (frame count given) and the PC checks.
 #ifdef OR_X68K
             const bool auto_start=max_frames!=0||road_demo;
+            // Driving demo without an end (frame count 0): when a game is over and the attract mode
+            // is back, credit and start again, so the games go on one after another.
+            if(road_demo&&max_frames==0&&ingame>=0&&outrun.game_state==GS_ATTRACT){ingame=-1;cycle_start=frame;}
 #else
             const bool auto_start=true;
 #endif
@@ -295,7 +298,9 @@ int main(int argc,char**argv) {
             if(road_demo&&max_frames==0){
                 static int tune=-1,last_tune=-1;
                 if(outrun.game_state==GS_MUSIC){
-                    if(tune<0){const unsigned r=unsigned(native_clock());tune=last_tune<0?int(r%3):(last_tune+1+int(r&1))%3;last_tune=tune;}
+                    // (the time since power-on alone is the same at every start in an emulator: the
+                    // clock time (RTC) is mixed in)
+                    if(tune<0){const unsigned r=(unsigned(native_clock())*2654435761u^unsigned(_iocs_timeget())*40503u)>>16;tune=last_tune<0?int(r%3):(last_tune+1+int(r&1))%3;last_tune=tune;}
                     input.keys[Input::LEFT]=tune==0;input.keys[Input::RIGHT]=tune==2;
                 }else tune=-1;
             }
