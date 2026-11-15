@@ -639,17 +639,30 @@ static void build_car(CarPacket&out,const uint16_t*pal){
 static void build_car_body(CarPacket&out,const uint16_t*pal){
  out.count=out.patterns=out.palettes=out.overflow=out.line_max=out.text_mode=0;capture_palette=pal;
  const unsigned ids[]={OSprites::SPRITE_FERRARI,OSprites::SPRITE_PASS1,OSprites::SPRITE_PASS2,OSprites::SPRITE_CRASH,OSprites::SPRITE_CRASH_PASS1,OSprites::SPRITE_CRASH_PASS2};
- unsigned indices[6],num=0;int low=224,high=0;
+ // (sprite index, entry) of the car sprites, drawn in sprite order
+ struct CarPart{int index;const uint16_t*data;}parts[6];unsigned num=0;int low=224,high=0;bool body=false;
+ // The game leaves the car body out of the sprite list for one step when the car hits something
+ // (the crash code of the original, 0x138C, returns before the body is listed). The arcade shows
+ // that for 1/60 s; here a drawn picture stays on the screen for 1/30 s or longer, and only the
+ // heads of the people are seen (#57). Such a step draws the body of the step before.
+ static uint16_t last_body[7];static bool last_body_ok=false;
+ auto add=[&](int index,const uint16_t*r){
+  int top=(r[0]&511)-256,rows=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rows-1:1-rows);
+  low=std::min(low,std::min(top,bottom));high=std::max(high,std::max(top,bottom)+1);parts[num++]={index,r};
+ };
  for(unsigned id:ids){
   const oentry&e=osprites.jump_table[id];unsigned index=e.dst_index;
   if(!(e.control&OSprites::ENABLE)||index>=osprites.sprite_count||osprites.sprite_entries[index].scratch!=id)continue;
   const uint16_t*r=osprites.sprite_entries[index].data;if(r[0]&0xd000)continue;
-  int top=(r[0]&511)-256,rows=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rows-1:1-rows);
-  low=std::min(low,std::min(top,bottom));high=std::max(high,std::max(top,bottom)+1);indices[num++]=index;
+  if(id==OSprites::SPRITE_FERRARI||id==OSprites::SPRITE_CRASH){body=true;memcpy(last_body,r,14);}
+  add(index,r);
  }
+ if(body)last_body_ok=true;
+ else if(num&&last_body_ok)add(-1,last_body);  // (behind the people)
+ else last_body_ok=false;
  low=std::max(0,low);high=std::min(224,high);
- std::sort(indices,indices+num);
- uint16_t key[6*7];for(unsigned i=0;i<num;i++)memcpy(key+i*7,osprites.sprite_entries[indices[i]].data,14);
+ std::sort(parts,parts+num,[](const CarPart&a,const CarPart&b){return a.index<b.index;});
+ uint16_t key[6*7];for(unsigned i=0;i<num;i++)memcpy(key+i*7,parts[i].data,14);
  uint32_t key_hash=car_key_hash(key,num*7)^(uint32_t(low)<<8)^uint32_t(high);
  CarCacheEntry*cached=low<high?car_cache_find(key_hash,num,low,high,key,pal):0;
  if(cached)++car_cache_hits;else if(low<high)++car_cache_misses;
@@ -671,7 +684,7 @@ static void build_car_body(CarPacket&out,const uint16_t*pal){
  int clear_low=std::min(low,std::min(old_low,capture_low)),clear_high=std::max(high,std::max(old_high,capture_high));
  if(clear_low<clear_high)memset(capture_pixels+clear_low*320,0,(clear_high-clear_low)*320*2);
  old_low=low;old_high=high;capture_low=low;capture_high=high;
- for(unsigned i=0;i<num;i++)video.sprite_layer->capture_entry(osprites.sprite_entries[indices[i]].data,capture_pixels);
+ for(unsigned i=0;i<num;i++)video.sprite_layer->capture_entry(parts[i].data,capture_pixels);
 #ifdef OR_X68K
  car_fine_capture+=platform_fine_clock()-tc;
 #endif
@@ -680,7 +693,7 @@ static void build_car_body(CarPacket&out,const uint16_t*pal){
  if(std::getenv("STAGE1_CHECK_CAR")){
   uint16_t saved[2048],test[2048]={0};static uint16_t reference[320*224];
   video.sprite_layer->save_render_state(saved);
-  for(unsigned i=0;i<num;i++)memcpy(test+1024+i*8,osprites.sprite_entries[indices[i]].data,14);
+  for(unsigned i=0;i<num;i++)memcpy(test+1024+i*8,parts[i].data,14);
   test[1024+num*8]=0x8000;video.sprite_layer->load_render_state(test);
   memset(reference,0,sizeof reference);uint16_t*previous=video.pixels;video.pixels=reference;
   video.sprite_layer->render_reference(8);video.pixels=previous;video.sprite_layer->load_render_state(saved);
