@@ -135,6 +135,25 @@ road_raster_irq:
  move.l 20(%a0),0xe82242
  move.l 24(%a0),0xe82246
 1:
+ /* #56: a BG plane that comes on in this row (0xeb0808, mask bit 9, now bit 4) is switched on
+    before the graphic palette. On a row where the road moves from the graphic page to a BG plane,
+    the palette turns the page to the off-road colour; written first, it showed one line of that
+    colour across the screen until the plane came on (XEiJ, pix68k). A plane that goes off keeps
+    the old order (palette first, then the switch), for the same reason the other way round.
+    (row 0: the row "before" is read from just in front of the rows; every order is right there) */
+ btst #4,%d0
+ beq 1f
+ move.l %d1,-(%sp)
+ move.w -4(%a0),%d1            /* road_enable of the row before */
+ not.w %d1
+ and.w 44(%a0),%d1
+ and.w #9,%d1                  /* planes (bit 0: BG0, bit 3: BG1) that come on */
+ beq 2f
+ move.w 44(%a0),0xeb0808
+ bclr #4,%d0                   /* (not written again below) */
+2:
+ move.l (%sp)+,%d1
+1:
  /* r022: graphic palette 240..243 and 247 = road classes 0,1,2,3 and 7 */
  lsr.w #1,%d0
  bcc 1f
