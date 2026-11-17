@@ -74,6 +74,8 @@ Keys
 ----
 C credit / ENTER start / UP or Z accelerate / DOWN or X brake / LEFT RIGHT steer /
 SPACE gear / 1-4 display / G roadside objects / H score display / R restart / ESC quit
+Joystick (port 1 or 2): LEFT RIGHT steer / A accelerate / B brake / UP high gear /
+DOWN low gear; out of the game B also gives a credit and A also starts
 (T: time stays at 99, A: drives by itself - check aids)
 
 Not in v0.2: sound. Shadows are not shown. Where more than 32 sprites meet on one
@@ -137,6 +139,8 @@ L 負荷の軽い/重いの切替、ESC 終了（終了時に速さの数字を�
 
 操作: C クレジット / Enter スタート / ↑かZ アクセル / ↓かX ブレーキ / ←→ ハンドル /
       Space ギア / 1〜4 表示 / G 景物 / H 点数表示 / R 再開始 / ESC 終了
+ジョイスティック（ポート1か2）: ←→ ハンドル / A アクセル / B ブレーキ / ↑ 高速ギア /
+      ↓ 低速ギア（ゲーム中以外は B でもクレジット、A でもスタート）
 v0.2では音は出ません。
 
 v0.2での変更

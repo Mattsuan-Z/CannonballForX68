@@ -103,6 +103,26 @@ static bool platform_keys(int frame,int ingame,bool demo){
         input.keys[Input::GEAR1]=native_key(0x35);
         input.keys[Input::COIN]=input.keys[Input::COIN]||native_key(0x2c);
         input.keys[Input::START]=input.keys[Input::START]||native_key(0x1d);
+        // Joystick ports 1 and 2 (8255 at 0xe9a001/0xe9a003, a bit is 0 while held): left/right
+        // steer, A accelerates, B brakes, up the high gear, down the low gear. Out of the game
+        // (a pad has no coin or start button) B also puts in a credit and A also starts.
+        // A port that reads up and down (or left and right) at once has no stick: left out.
+        auto port=[](uint32_t a)->unsigned{const unsigned v=~unsigned(*(volatile uint8_t*)a)&0x6f;return (v&3)==3||(v&12)==12?0:v;};
+        const unsigned pad=port(0xe9a001)|port(0xe9a003);
+        if(pad){
+            input.keys[Input::LEFT]=input.keys[Input::LEFT]||(pad&4);
+            input.keys[Input::RIGHT]=input.keys[Input::RIGHT]||(pad&8);
+            input.keys[Input::ACCEL]=input.keys[Input::ACCEL]||(pad&0x20);   // (also the name entry of the best scores)
+            input.keys[Input::BRAKE]=input.keys[Input::BRAKE]||(pad&0x40);
+            if(outrun.game_state==GS_INGAME){
+                // the gear key changes the gear each time it is pressed: press it only when the
+                // stick asks for the other gear (oinputs.gear: true = high)
+                if(((pad&1)&&!oinputs.gear)||((pad&2)&&oinputs.gear))input.keys[Input::GEAR1]=!input.keys_old[Input::GEAR1];
+            }else{
+                input.keys[Input::COIN]=input.keys[Input::COIN]||(pad&0x40);
+                input.keys[Input::START]=input.keys[Input::START]||(pad&0x20);
+            }
+        }
     }
     (void)frame;(void)ingame;return true;
 }
