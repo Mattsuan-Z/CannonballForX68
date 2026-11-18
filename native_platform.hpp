@@ -8,6 +8,11 @@
 #include "report_pager.hpp"
 #include "road_bridge.hpp"
 #include "visuals.hpp"
+#include "x68k_sysstat.hpp"
+#include <x68k/dos.h>
+#include <cstring>
+#include <cstdlib>
+extern "C"{extern uint8_t audio_pcm_place;}
 #define HW16(a) (*(volatile uint16_t*)(a))
 #define HW8(a) (*(volatile uint8_t*)(a))
 extern "C" {
@@ -15,9 +20,68 @@ void road_vblank_irq();void road_raster_irq();
 RoadRow* volatile road_active=0;
 RoadRow* volatile road_pending=0;
 RoadRow* volatile road_scan=0;
+// r031f: where the raster interrupt reads RoadFrame::row_changed (set with road_scan at the vertical blank)
+extern "C"{uint16_t* volatile road_mask_scan=0;uint32_t road_mask_offset=uint32_t(offsetof(RoadFrame,row_changed));}
 volatile uint32_t road_vblanks=0,road_shown=0,road_irq_count=0;
+extern "C"{volatile uint8_t road_vblank_busy=0;volatile uint32_t road_vblank_overruns=0;}
+static uint32_t io_probe_ns[5],io_probe_n[5],pcg_long_ns=0;
+static int native_light_mode=-1;   // -1 by the measured bus, 0 FULL, 1 LIGHT
+extern "C"{extern volatile uint8_t audio_hold;extern volatile uint32_t audio_ticks_done,audio_fm_writes,audio_fm_timeouts,audio_pcm_bytes,audio_pcm_resyncs;extern uint8_t audio_pcm_enabled,audio_fm_enabled;extern uint8_t audio_enabled;extern uint16_t audio_ticks_per_blank;void audio_silence();void audio_start(int with_game);}
+#ifdef CBX68_ASM_CHECK
+extern "C"{extern volatile uint32_t audio_mix_check[2];}
+#endif
+#ifdef CBX68_AUDIO_LOG
+extern "C"{extern uint32_t audio_log[];extern volatile uint32_t audio_log_n;}
+#endif
+// MPU caches (main.cpp calls native_cache_on at the start, platform_exit puts the state back).
+// Asked through IOCS _SYS_STAT (d1=1 reads the state: bit 0 instruction, bit 1 data; d1=4 sets it
+// from d2; d1=3 is not the state but "push and invalidate"), which the X68030 ROM and the 68060 accelerator's driver provide. Without them the call
+// fails and nothing is touched: turning the caches on in the CACR by hand would also cache the I/O
+// area when nobody has set the MMU or the transparent translation registers up for it.
+// r031n: on a 060turbo the program runs faster in the board's local memory than in the machine's
+// main memory (a cache miss is filled about 3 times faster there). With 060turbo.sys loaded and
+// the program in main memory, it ends itself and is run again in local memory (IOCS _SYS_STAT
+// $5001; main memory is used again when local memory is short). The word MAIN is added to the
+// arguments of the second run so that it is not tried twice; MAIN typed by hand keeps the program
+// in main memory. Must be called before anything is set up: the first run ends inside the call.
+static void native_run_in_local_memory(){
+ if(!x68k_has_060turbo()||x68k_sys_stat(0x4000)<=0)return;
+ // Only in 060turbo.sys's extended mode (its -xm option): there Human68k's memory reaches into
+ // local memory. In the compatible mode a program cannot be loaded there.
+ if(!x68k_extended_mode())return;
+ if(x68k_in_local_memory(reinterpret_cast<const void*>(&native_run_in_local_memory)))return;
+ const struct dos_psp*const psp=_dos_getpdb();
+ const unsigned char*const line=reinterpret_cast<const unsigned char*>(psp->comline);
+ const unsigned len=line[0];if(len>240)return;
+ static char path[96];static unsigned char again[8+1+255+1];
+ unsigned n=0;for(unsigned k=0;k<68&&psp->exe_path[k];k++)path[n++]=psp->exe_path[k];
+ for(unsigned k=0;k<24&&psp->exe_name[k];k++)path[n++]=psp->exe_name[k];
+ path[n]=0;
+ memcpy(again,line-8,8);                                  // (the 8 bytes before the line say how it is coded)
+ again[8]=uint8_t(len+5);memcpy(again+9,line+1,len);memcpy(again+9+len," MAIN",5);again[9+len+5]=0;
+ x68k_sys_stat(0x5001,1,path,again+8,0);                  // does not come back when it works
 }
-static RoadFrame road_frames[3];   // r029: one shown, one waiting for the next vertical blank, one being built
+static int native_cache_before=-1;static bool native_cache_set=false,native_cache_was_set=false;
+static long native_sys_stat(long mode,long value){
+ register long d0 __asm__("d0")=0xac;register long d1 __asm__("d1")=mode;register long d2 __asm__("d2")=value;
+ __asm__ volatile("trap #15":"+d"(d0),"+d"(d1),"+d"(d2)::"memory");
+ return d0;
+}
+static void native_cache_on(){
+ native_cache_before=int(native_sys_stat(1,0));
+ if(native_cache_before>=0&&(native_cache_before&3)!=3){native_sys_stat(4,3);native_cache_set=native_cache_was_set=true;}
+}
+static void native_cache_restore(){
+ if(!native_cache_set)return;
+ native_sys_stat(4,native_cache_before&3);native_cache_set=false;
+}
+static int native_audio_game=1;   // main.cpp: 0 for the display test (no ROMs, no sound program)
+#ifdef CBX68_PROF
+// sampling profiler (road_irq.S): hits per 16 bytes of text, last bucket = outside the program
+extern "C"{extern char _start[],_etext[];uint32_t prof_text_size=0;uint32_t prof_hist[(0x140000>>4)+1];}
+#endif
+}
+alignas(16) static RoadFrame road_frames[3];   // r029: one shown, one waiting for the next vertical blank, one being built
 // r029: frame pacing (Masa compared the three on XM6 and chose VSYNC, 2026-11-08):
 //  VSYNC (default): one picture every 2 screen refreshes (55.46 Hz): even, 27.7 pictures a
 //                   second; the game runs about 8% slower than real time.
@@ -98,26 +162,83 @@ static void platform_init(){
  if(native_hz60)HW16(0xe80008)=524;   // r029 HZ60: R04 vertical total 525 lines: 31.5 kHz / 525 = 60 Hz (display lines 72..520 unchanged)
  HW16(0xe80012)=1023;HW16(0xe82400)=1;HW16(0xe82500)=0x06e4;HW16(0xe82600)=0x004f;
  for(unsigned a=0xe80014;a<=0xe80026;a+=2)HW16(a)=0;
- road_build(hwroad,display_palette,road_frames[0]);road_stream(road_frames[0]);road_active=road_frames[0].rows;
+ road_build(hwroad,display_palette,road_frames[0]);road_stream(road_frames[0]);road_rows_changed(road_frames[0]);road_active=road_frames[0].rows;
+ audio_start(native_audio_game);   // r031: FM chip (needs supervisor mode); not in the display test
  unsigned short sr=mask_irqs();
  saved_vblank=*(volatile uint32_t*)0x134;saved_raster=*(volatile uint32_t*)0x138;
  saved_iera=HW8(0xe88007);saved_imra=HW8(0xe88013);saved_aer=HW8(0xe88003);saved_tacr=HW8(0xe88019);saved_tadr=HW8(0xe8801f);
+
+#ifdef CBX68_PROF
+ prof_text_size=uint32_t(_etext-_start);if(prof_text_size>0x140000)prof_text_size=0x140000;
+#endif
  *(volatile uint32_t*)0x134=(uint32_t)road_vblank_irq;*(volatile uint32_t*)0x138=(uint32_t)road_raster_irq;
  HW8(0xe88003)=saved_aer&0xef;HW8(0xe88007)=saved_iera|0x60;HW8(0xe88013)=saved_imra|0x60;
  HW8(0xe8800b)&=0x9f;HW8(0xe8800f)&=0x9f;
  HW8(0xe88019)=0;HW8(0xe8801f)=1;HW8(0xe88019)=8;
- HW16(0xeb0808)=0x0219;restore_irqs(sr);
+ HW16(0xeb0808)=0x0219;
+ // Line budget of the scenery jobs from the time a long written to the PCG takes with the sprite
+ // display on (MFP timer C, 50 us a step; pattern 127 is in the scenery pool and is loaded
+ // before it is shown). 60 us of longs a line period (63.5 us): the rest is for the line's own
+ // registers and the other interrupts. XEiJ 060turbo: 50 without wait cycles, 31 with them.
+ {volatile uint32_t*q=(volatile uint32_t*)(0xeb8000UL+127*128);
+  unsigned t0=HW8(0xe88023),t=t0;uint32_t guard=0;while(t==t0&&++guard<200000UL)t=HW8(0xe88023);t0=t;
+  uint32_t n=0;unsigned steps=0;
+  while(steps<40&&n<400000UL){for(unsigned j=0;j<32;j++)q[j]=0;n+=32;t=HW8(0xe88023);steps=(t0+200-t)%200;}
+  pcg_long_ns=steps?steps*50000UL/n:0;
+  // #62: 45 us, not 60. On the 060turbo's bus (XEiJ with wait cycles: 1.8 us a long, 32 longs a
+  // line) the jobs took nearly every line period, and in the pillar part of stage 2 the work of
+  // the vertical blank did not end before the next one (588 of 3926 blanks): the scenery of those
+  // refreshes was cut off and showed wrong patterns. With 24 longs none is cut off, and 6.5 tiles
+  // a picture are left out.
+  if(pcg_long_ns)visuals_set_line_budget(unsigned(45000UL/pcg_long_ns));
+  // r031l: light mode (a frame keeps only as many tiles as there are patterns, plus a few) only by
+  // the argument LIGHT. #62: on the 060turbo it left out most of the pillars of stage 2 and the
+  // cars among them; drawing all of them and showing fewer pictures (frame skip) looks better.
+  visuals_set_light(native_light_mode>0);}
+ restore_irqs(sr);
  native_started=native_clock();native_frames=0;
  fine_start=fine_phase_start=platform_fine_clock();
 }
+// Picture skipping: the game does one step a screen refresh (VSYNC pace). When drawing has put
+// it 2 or more refreshes behind, the next picture is left out (the step itself still runs), at
+// most 27 in a row so the screen still changes once a second. Far behind (a long pause), the count starts again.
+#ifndef CBX68_SKIP_RENDER_PREP
+#define CBX68_SKIP_RENDER_PREP 1
+#endif
+static const bool SKIP_RENDER_PREP=CBX68_SKIP_RENDER_PREP;   // r031m: a step whose picture is skipped leaves out what only the picture needs
+static int bench_from=0;static bool bench_hold=false;   // main.cpp: FROMn, HOLD
+static int native_skip_mode=-1,native_lag=0;static uint32_t native_skipped_draws=0;
+// (the schedule: frame f0 belongs at screen refresh v0, and every frame after it one refresh later)
+static uint32_t native_skip_v0=0;static int native_skip_f0=0;static bool native_skip_started=false;
+static bool platform_draw_due(int frame){
+ uint32_t&v0=native_skip_v0;int&f0=native_skip_f0;bool&started=native_skip_started;static unsigned row=0;
+ const uint32_t v=road_vblanks;
+ if(!started){v0=v;f0=frame;started=true;}
+ const int lag=int(v-v0)-(frame-f0);native_lag=lag;
+ if(lag>60||lag<-60){v0=v;f0=frame;row=0;native_lag=0;return true;}
+ if(lag<0){v0=v;f0=frame;native_lag=0;}                    // ahead (platform_sync waits): no credit is saved
+ if(lag>=2&&row<27){++row;++native_skipped_draws;return false;}   // (27: at least one picture a second)
+ row=0;return true;
+}
 static void platform_sync(int frame){
  // Use one display period as the deadline; never repay old missed periods.
+ // FROMn (bench): the steps before the measured part are not drawn and need no pace
+ if(frame+1<bench_from)return;
  static uint32_t deadline=0;static bool previous30=true;
  bool mode30=render_schedule.draw30;
  if(mode30&&!(frame&1))return;
  if(native_vsync_pace){   // r029: count screen refreshes instead of the clock
   static uint32_t vdeadline=0;static bool vprevious30=true;static bool vstarted=false;
   const uint32_t v=road_vblanks;
+  // r031o: with picture skipping, wait only until the refresh this frame ends at on the schedule
+  // of platform_draw_due. (Before: after a step that was behind, the next wait was 2 whole
+  // refreshes counted from the end of the step, so the time the step itself took was lost again.)
+  if(native_skip_mode>0&&native_skip_started){
+   // (platform_draw_due is asked about frame+2 next, the picture of the next game step)
+   const uint32_t until=native_skip_v0+uint32_t(frame+2-native_skip_f0);
+   while(int32_t(road_vblanks-until)<0){native_idle_waits++;__asm__ volatile("stop #0x2000":::"memory");}
+   vstarted=false;return;
+  }
   if(!vstarted||vprevious30!=mode30){vdeadline=v;vprevious30=mode30;vstarted=true;}
   vdeadline+=mode30?2:1;
   {unsigned m=native_measuring_visual;if(fine_draw_work>fine_work_max[m])fine_work_max[m]=fine_draw_work;fine_draw_work=0;
@@ -154,6 +275,16 @@ static void native_road_memory_check(){
 static void native_road_memory_report(){ report_printf("ROAD MEMORY map_errors=%u pattern_errors=%u ground_errors=%u\n",road_map_errors,road_pattern_errors,road_ground_errors);}
 static void platform_exit(){
  uint32_t t=native_elapsed();unsigned short sr=mask_irqs();
+ audio_hold=1;audio_silence();   // r031
+ // Bus speed probe: ns per 32-bit write to RAM, PCG, BG scroll, text palette and CRTC R09.
+ // Run before the sprite display is turned off: XEiJ (and the real sprite controller) make the
+ // CPU wait longer for the PCG while the display is on. Interrupts are off here, so time is read straight from the MFP timer C counter (50 us a step).
+ {static uint32_t probe_ram;static const uint32_t probe_at[5]={0,0xeb8000UL,0xeb0800UL,0xe82200UL,0xe80012UL};
+  for(unsigned k=0;k<5;k++){volatile uint32_t*q=k?(volatile uint32_t*)probe_at[k]:(volatile uint32_t*)&probe_ram;const uint32_t v=*q;
+   unsigned t0=HW8(0xe88023),t=t0;while(t==t0)t=HW8(0xe88023);t0=t;   // start on a step edge
+   uint32_t n=0;unsigned steps=0;
+   while(steps<40&&n<400000UL){for(unsigned j=0;j<8;j++){*q=v;*q=v;*q=v;*q=v;}n+=32;t=HW8(0xe88023);steps=(t0+200-t)%200;}
+   io_probe_ns[k]=steps?steps*50000UL/n:0;io_probe_n[k]=n;}}
  HW8(0xe88019)=0;HW16(0xe80012)=1023;HW16(0xeb0808)=0;
  *(volatile uint32_t*)0x134=saved_vblank;*(volatile uint32_t*)0x138=saved_raster;
  HW8(0xe88003)=saved_aer;HW8(0xe88007)=saved_iera;HW8(0xe88013)=saved_imra;
@@ -165,7 +296,10 @@ static void platform_exit(){
  for(unsigned i=0;i<16384;i++)HW16(0xeb8000UL+i*2)=0;
  // r027b: the score etc. use all 4 text planes; the console clears only its own
  for(unsigned p=0;p<4;p++)for(unsigned i=0;i<512*64;i++)HW16(0xe00000UL+p*0x20000UL+i*2)=0;
+ native_cache_restore();
  restore_irqs(sr);_iocs_crtmod(native_old_mode);_iocs_sp_off();_iocs_b_curon();for(unsigned i=0;i<16;i++)HW16(0xe82200UL+i*2)=saved_text_palette[i];_iocs_b_clr_al();_iocs_b_locate(0,0);if(native_ssp>0)_iocs_b_super(native_ssp);
+ // (written before the pages of figures: the measuring scripts wait for this file, then press keys)
+ FILE*f=fopen("ROADPERF.TXT","w");if(f){fprintf(f,"visual_mode=%u\nbackground_columns=%lu\ncar_frames=%lu\ncar_text_frames=%lu\nmax_sprites=%u\nmax_patterns=%u\nmax_line=%u\noverflow=%lu\n",visual_mode,(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_text_frames,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);fprintf(f,"submitted=%lu shown=%lu cs=%lu\nlogic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\nvblanks=%lu raster_irqs=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3],(unsigned long)road_vblanks,(unsigned long)road_irq_count);fclose(f);}
  report_pager_start();   // r028: stop at each full screen
 
  const char* labels[]={"ROAD","BG","CAR","BOTH"};
@@ -175,6 +309,12 @@ static void platform_exit(){
  }
  if(native_irq_failed)report_puts("ROAD INTERRUPT TIMEOUT - report the counters below.");
  report_printf("R028 IDLE stop_waits=%lu\n",(unsigned long)native_idle_waits);
+ report_printf("R031 SOUND %s ticks=%lu fm_writes=%lu fm_timeouts=%lu\n",audio_enabled&&audio_fm_enabled?"FM":"off",(unsigned long)audio_ticks_done,(unsigned long)audio_fm_writes,(unsigned long)audio_fm_timeouts);
+ report_printf("R031 PCM %s adpcm_bytes=%lu resyncs=%lu\n",audio_enabled&&audio_pcm_enabled?"ADPCM":"off",(unsigned long)audio_pcm_bytes,(unsigned long)audio_pcm_resyncs);
+#ifdef CBX68_ASM_CHECK
+ report_printf("ASM CHECK pcm_mix_run runs=%lu mismatches=%lu\n",(unsigned long)audio_mix_check[0],(unsigned long)audio_mix_check[1]);
+#endif
+ report_printf("SKIP %s skipped_draws=%lu\n",native_skip_mode>0?"on":"off",(unsigned long)native_skipped_draws);
  report_printf("R029 PACE %s screen=%s\n",native_vsync_pace?"VSYNC (2 refreshes a picture)":"CLOCK (30 a second)",native_hz60?"60 Hz":"55.46 Hz");
  report_printf("R029 HANDOFF calls=%lu stop_waits=%lu us/draw=%lu\n",(unsigned long)native_handoff_calls,(unsigned long)native_handoff_waits,(unsigned long)(native_handoff_calls?native_handoff_fine*50UL/native_handoff_calls:0));
  report_printf("ROAD BRIDGE r030 320x224 BG/raster\nframes=%lu shown=%lu cs=%lu fps_x1000=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,t?native_frames*100000UL/t:0);
@@ -183,7 +323,15 @@ static void platform_exit(){
  report_printf("bg_columns=%lu car_frames=%lu car_tiles=%lu max_tiles=%u max_patterns=%u max_line=%u overflow=%lu\n",(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_tiles_total,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);
  report_printf("car_text_frames=%lu\n",(unsigned long)car_text_frames);
  report_printf("shown_x1000=%lu\n",t?road_shown*100000UL/t:0);
- report_printf("vblanks=%lu raster_irqs=%lu\n",(unsigned long)road_vblanks,(unsigned long)road_irq_count);
+ {int on_stack=0;static int in_data=1;void*const heap=malloc(16);
+  const auto where=[](const void*p){return x68k_in_local_memory(p)?"LOCAL":"MAIN";};
+  report_printf("MEMORY 060turbo.sys=%d mode=%s code=%s data=%s heap=%s stack=%s pcm=%s cpu_bits=%ld\n",int(x68k_has_060turbo()),!x68k_has_060turbo()?"-":x68k_extended_mode()?"extended":"compatible",
+   where(reinterpret_cast<const void*>(&native_run_in_local_memory)),where(&in_data),where(heap),where(&on_stack),audio_pcm_place==1?"MAIN(taken)":audio_pcm_place==2?"none":"in program",x68k_has_060turbo()?x68k_sys_stat(0xc006):-1L);
+  free(heap);}
+ report_printf("MPU cache at start=%d%s (-1: no cache control in this system, 3: both on)\n",native_cache_before,native_cache_was_set?", turned on by this program":"");
+ report_printf("IOSPEED ns/long ram=%lu pcg=%lu bg=%lu pal=%lu crtc=%lu\n",(unsigned long)io_probe_ns[0],(unsigned long)io_probe_ns[1],(unsigned long)io_probe_ns[2],(unsigned long)io_probe_ns[3],(unsigned long)io_probe_ns[4]);
+ report_printf("LINE BUDGET longs=%u (pcg ns/long at start=%lu) scenery=%s\n",visuals_line_budget(),(unsigned long)pcg_long_ns,visuals_light()?"LIGHT":"FULL");
+ report_printf("vblanks=%lu raster_irqs=%lu vblank_overruns=%lu\n",(unsigned long)road_vblanks,(unsigned long)road_irq_count,(unsigned long)road_vblank_overruns);
  {
   uint32_t fine_total=fine_last-fine_start;
   report_printf("FINE r024 unit=50us total=%lu cs_equiv=%lu tcdr=%u..%u backsteps=%lu retries=%lu\n",(unsigned long)fine_total,(unsigned long)(fine_total/200),fine_tmin,fine_tmax,(unsigned long)fine_backsteps,(unsigned long)fine_retries);
@@ -194,5 +342,10 @@ static void platform_exit(){
     (unsigned long)(fine_phase_max[m][1]*50UL),(unsigned long)(fine_work_max[m]*50UL),(unsigned long)fine_overruns[m],(unsigned long)(fine_late[m]/60));
   }
  }
- FILE*f=fopen("ROADPERF.TXT","w");if(f){fprintf(f,"visual_mode=%u\nbackground_columns=%lu\ncar_frames=%lu\ncar_text_frames=%lu\nmax_sprites=%u\nmax_patterns=%u\nmax_line=%u\noverflow=%lu\n",visual_mode,(unsigned long)background_columns,(unsigned long)car_frames,(unsigned long)car_text_frames,car_peak_tiles,car_peak_patterns,car_peak_line,(unsigned long)car_overflows);fprintf(f,"submitted=%lu shown=%lu cs=%lu\nlogic_cs=%lu table_cs=%lu publish_cs=%lu wait_cs=%lu\nvblanks=%lu raster_irqs=%lu\n",(unsigned long)native_frames,(unsigned long)road_shown,(unsigned long)t,(unsigned long)native_phase_cs[0],(unsigned long)native_phase_cs[1],(unsigned long)native_phase_cs[2],(unsigned long)native_phase_cs[3],(unsigned long)road_vblanks,(unsigned long)road_irq_count);fclose(f);}
+#ifdef CBX68_AUDIO_LOG
+ {FILE*af=fopen("AUDIO.BIN","wb");if(af){fwrite(audio_log,4,audio_log_n,af);fclose(af);}}
+#endif
+#ifdef CBX68_PROF
+ {FILE*pf=fopen("PROF.BIN","wb");if(pf){fwrite(&prof_text_size,4,1,pf);fwrite(prof_hist,4,(prof_text_size>>4)+1,pf);fclose(pf);}}
+#endif
 }

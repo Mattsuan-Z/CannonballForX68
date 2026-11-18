@@ -18,7 +18,12 @@ bool hud_enabled=true;   // r027: H key, score/time/speed on the text plane
 uint32_t background_columns=0,car_overflows=0,car_tiles_total=0,car_frames=0,car_text_frames=0,visual_frames[4]={0,0,0,0};
 unsigned car_peak_tiles=0,car_peak_patterns=0,car_peak_line=0;
 typedef uint32_t __attribute__((may_alias)) alias_u32;
-alignas(4) static uint16_t capture_pixels[320*224];
+// CBX68_PAD (timing check only): shifts the code and data placed after this file by a few bytes;
+// with the 16-byte alignment the timing must not change.
+#ifdef CBX68_PAD
+__asm__(".text\n .short 0x4e71,0x4e71,0x4e71\n.data\n .skip 6\n.bss\n .skip 6\n.text");
+#endif
+alignas(16) static uint16_t capture_pixels[320*224];
 static const uint16_t* capture_palette=0;
 static const uint16_t* background_palette=0;
 static volatile uint16_t text_active_bank=0;
@@ -31,9 +36,8 @@ static uint32_t background_recomposed_rows=0;
 static uint32_t background_far_checks=0,background_data_errors=0,background_palette_errors=0;
 static bool background_ready=false,background_attempted=false,background_refresh=false,background_palette_refresh=false;
 static uint32_t background_rebuilds=0,background_capacity_waits=0,background_source_frames=0;
-#ifndef OR_X68K
-static uint8_t background_ring[512*512];
-#endif
+// PC: the background bytes of the GVRAM. X68000 (r031h): a copy of them in main memory.
+alignas(16) static uint8_t background_ring[512*512];
 static int mod(int v,int n){v%=n;return v<0?v+n:v;}
 static uint16_t tile_word(unsigned a){const uint8_t*p=video.tile_layer->text_ram;return (p[a]<<8)|p[a+1];}
 // A visible black pixel must not use the hardware transparent colour word.
@@ -308,8 +312,17 @@ static int unwrap_target(int previous,int requested,int width){int d=mod(request
 static void ring_column_rows(unsigned l,int world,unsigned y0,unsigned count){
  uint8_t val[512];fill_col(l,unsigned(world)&1023,y0&511,count,val);
  const unsigned s=l?4:0;const uint8_t keep=l?0x0f:0xf0;
+#ifdef OR_X68K
+ // r031h: background_ring is a copy in main memory of the background bytes in the GVRAM. The byte
+ // is read from the copy (a GVRAM read costs as much as a write on the real bus) and written to
+ // the GVRAM only when it changes.
+ uint8_t*const sh=background_ring+(unsigned(world)&511);volatile uint8_t*const base=BG_STORE_BASE+BG_STORE_X(unsigned(world)&511);
+ for(unsigned i=0;i<count;i++){const unsigned yy=(y0+i)&511;const uint8_t old=sh[yy*512],v=uint8_t((old&keep)|((val[i]&15)<<s));
+  if(v!=old){sh[yy*512]=v;base[yy*BG_STORE_ROW]=v;}}
+#else
  volatile uint8_t*base=BG_STORE_BASE+BG_STORE_X(unsigned(world)&511);
  for(unsigned i=0;i<count;i++){volatile uint8_t*p=base+((y0+i)&511)*BG_STORE_ROW;*p=uint8_t((*p&keep)|((val[i]&15)<<s));}
+#endif
 }
 // ring row y, ring columns of world first..first+count-1
 static void ring_row_span(unsigned l,int first,unsigned count,unsigned y){
@@ -320,7 +333,13 @@ static void ring_row_span(unsigned l,int first,unsigned count,unsigned y){
  while(i<count){
   unsigned c=unsigned(first+int(i))&511,n=512-c;if(n>count-i)n=count-i;
   volatile uint8_t*out=row+BG_STORE_X(c);
+#ifdef OR_X68K
+  uint8_t*const sh=background_ring+(y&511)*512+c;
+  for(unsigned k=0;k<n;k++){const uint8_t old=sh[k],v=uint8_t((old&keep)|((val[i+k]&15)<<s));
+   if(v!=old){sh[k]=v;out[BG_STORE_X(k)]=v;}}
+#else
   for(unsigned k=0;k<n;k++){volatile uint8_t*p=out+BG_STORE_X(k);*p=uint8_t((*p&keep)|((val[i+k]&15)<<s));}
+#endif
   i+=n;
  }
 }
@@ -349,8 +368,14 @@ static void ring_stream(unsigned l,int target,unsigned y0,unsigned shown,bool re
   R.dirty_all=false;R.dirty_half[0]=R.dirty_half[1]=false;R.pass_active=false;memset(R.pass_cols,0,sizeof R.pass_cols);++full_streams;
  }else{
   bool wrote=false;
-  if(d>0)for(int i=0;i<d;i++){ring_column_shown(l,R.loaded+416+i);wrote=true;}
-  else for(int i=d;i<0;i++){ring_column_shown(l,R.loaded-96+i);wrote=true;}
+  // r031j: the new columns are written row by row (each shown row: the span of new columns),
+  // not column by column: the layer page, the copy of the GVRAM bytes and the GVRAM are then read
+  // and written along their rows, a few cache lines a row instead of one a pixel. Same pixels.
+  if(d){const int first=d>0?R.loaded+416:R.loaded-96+d;const unsigned count=unsigned(d>0?d:-d);
+   for(unsigned y=0;y<512;y++)if(R.row_shown[y])ring_row_span(l,first,count,y);
+   for(unsigned i=0;i<count;i++){const unsigned c=unsigned(first+int(i))&511;if(R.column_dirty[c]){R.column_dirty[c]=false;--R.dirty_count;}
+    ++background_columns;++ring_column_count[l];}
+   wrote=true;}
   if(wrote)ring_drop_hidden(R);
  }
  if(R.dirty_all){
@@ -446,9 +471,8 @@ void visuals_stream(const RoadFrame&f){
 #ifdef OR_X68K
    for(unsigned y=0;y<224;y++){volatile uint8_t*d=(volatile uint8_t*)(0xc00001UL+y*1024UL);const uint8_t*src=static_img+y*320;
     for(unsigned x=0;x<320;x++)d[x*2]=src[x];}
-#else
-   for(unsigned y=0;y<224;y++)memcpy(background_ring+y*512,static_img+y*320,320);
 #endif
+   for(unsigned y=0;y<224;y++)memcpy(background_ring+y*512,static_img+y*320,320);   // (X68000: the copy of the GVRAM bytes)
    static_dirty=false;
   }
   return;
@@ -470,11 +494,17 @@ void visuals_stream(const RoadFrame&f){
 }
 void visuals_native_init(){near_loaded=far_loaded=0;bg_ring[0].loaded=bg_ring[1].loaded=0;}
 // Keep BG character rows 0..49 and 60 intact; other map rows are never displayed.
-static unsigned car_pattern_slot(unsigned index){
+static unsigned car_pattern_slot_slow(unsigned index){
  unsigned base=(road_atlas.tiles+3)/4,first=128-base;
  if(index<first)return base+index;
  unsigned k=index-first,row=k%13;row=row<10?50+row:61+row-10;
  return 128+(k/13)*64+row;
+}
+// (called for every job: from a table made at the first call, the road atlas is loaded by then)
+static unsigned car_pattern_slot(unsigned index){
+ static uint16_t slot[256];static bool made=false;
+ if(!made){for(unsigned i=0;i<256;i++)slot[i]=uint16_t(car_pattern_slot_slow(i));made=true;}
+ return index<256?slot[index]:car_pattern_slot_slow(index);
 }
 // Reuse the original 16-colour banks; split a tile only where banks overlap.
 // r020: banks met by the last build_car_direct() call, in first-seen order (for the car cache key).
@@ -609,17 +639,30 @@ static void build_car(CarPacket&out,const uint16_t*pal){
 static void build_car_body(CarPacket&out,const uint16_t*pal){
  out.count=out.patterns=out.palettes=out.overflow=out.line_max=out.text_mode=0;capture_palette=pal;
  const unsigned ids[]={OSprites::SPRITE_FERRARI,OSprites::SPRITE_PASS1,OSprites::SPRITE_PASS2,OSprites::SPRITE_CRASH,OSprites::SPRITE_CRASH_PASS1,OSprites::SPRITE_CRASH_PASS2};
- unsigned indices[6],num=0;int low=224,high=0;
+ // (sprite index, entry) of the car sprites, drawn in sprite order
+ struct CarPart{int index;const uint16_t*data;}parts[6];unsigned num=0;int low=224,high=0;bool body=false;
+ // The game leaves the car body out of the sprite list for one step when the car hits something
+ // (the crash code of the original, 0x138C, returns before the body is listed). The arcade shows
+ // that for 1/60 s; here a drawn picture stays on the screen for 1/30 s or longer, and only the
+ // heads of the people are seen (#57). Such a step draws the body of the step before.
+ static uint16_t last_body[7];static bool last_body_ok=false;
+ auto add=[&](int index,const uint16_t*r){
+  int top=(r[0]&511)-256,rows=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rows-1:1-rows);
+  low=std::min(low,std::min(top,bottom));high=std::max(high,std::max(top,bottom)+1);parts[num++]={index,r};
+ };
  for(unsigned id:ids){
   const oentry&e=osprites.jump_table[id];unsigned index=e.dst_index;
   if(!(e.control&OSprites::ENABLE)||index>=osprites.sprite_count||osprites.sprite_entries[index].scratch!=id)continue;
   const uint16_t*r=osprites.sprite_entries[index].data;if(r[0]&0xd000)continue;
-  int top=(r[0]&511)-256,rows=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rows-1:1-rows);
-  low=std::min(low,std::min(top,bottom));high=std::max(high,std::max(top,bottom)+1);indices[num++]=index;
+  if(id==OSprites::SPRITE_FERRARI||id==OSprites::SPRITE_CRASH){body=true;memcpy(last_body,r,14);}
+  add(index,r);
  }
+ if(body)last_body_ok=true;
+ else if(num&&last_body_ok)add(-1,last_body);  // (behind the people)
+ else last_body_ok=false;
  low=std::max(0,low);high=std::min(224,high);
- std::sort(indices,indices+num);
- uint16_t key[6*7];for(unsigned i=0;i<num;i++)memcpy(key+i*7,osprites.sprite_entries[indices[i]].data,14);
+ std::sort(parts,parts+num,[](const CarPart&a,const CarPart&b){return a.index<b.index;});
+ uint16_t key[6*7];for(unsigned i=0;i<num;i++)memcpy(key+i*7,parts[i].data,14);
  uint32_t key_hash=car_key_hash(key,num*7)^(uint32_t(low)<<8)^uint32_t(high);
  CarCacheEntry*cached=low<high?car_cache_find(key_hash,num,low,high,key,pal):0;
  if(cached)++car_cache_hits;else if(low<high)++car_cache_misses;
@@ -641,7 +684,7 @@ static void build_car_body(CarPacket&out,const uint16_t*pal){
  int clear_low=std::min(low,std::min(old_low,capture_low)),clear_high=std::max(high,std::max(old_high,capture_high));
  if(clear_low<clear_high)memset(capture_pixels+clear_low*320,0,(clear_high-clear_low)*320*2);
  old_low=low;old_high=high;capture_low=low;capture_high=high;
- for(unsigned i=0;i<num;i++)video.sprite_layer->capture_entry(osprites.sprite_entries[indices[i]].data,capture_pixels);
+ for(unsigned i=0;i<num;i++)video.sprite_layer->capture_entry(parts[i].data,capture_pixels);
 #ifdef OR_X68K
  car_fine_capture+=platform_fine_clock()-tc;
 #endif
@@ -650,7 +693,7 @@ static void build_car_body(CarPacket&out,const uint16_t*pal){
  if(std::getenv("STAGE1_CHECK_CAR")){
   uint16_t saved[2048],test[2048]={0};static uint16_t reference[320*224];
   video.sprite_layer->save_render_state(saved);
-  for(unsigned i=0;i<num;i++)memcpy(test+1024+i*8,osprites.sprite_entries[indices[i]].data,14);
+  for(unsigned i=0;i<num;i++)memcpy(test+1024+i*8,parts[i].data,14);
   test[1024+num*8]=0x8000;video.sprite_layer->load_render_state(test);
   memset(reference,0,sizeof reference);uint16_t*previous=video.pixels;video.pixels=reference;
   video.sprite_layer->render_reference(8);video.pixels=previous;video.sprite_layer->load_render_state(saved);
@@ -812,7 +855,13 @@ static void scenery_print(){
 //    SCENERY_LINE_BUDGET longs per line. Fresh ones are loaded in the vertical blank.
 //    What does not fit is left out (counted as dropped).
 // ---------------------------------------------------------------------------
-alignas(4) static uint16_t scenery_pixels[320*224];
+// The roadside objects are drawn into 8-bit codes: 0 = no pixel, 0x11..0xdf = a placed colour
+// ((block+1)<<4|index, blocks 0..12), 0xe0..0xfe = a colour not planned, slot code-0xe0 of the
+// frame (scenery_slot_idx holds its palette index; it is placed when the tile pass meets it),
+// 0xff = a pixel whose colour found no room (no pixel in the end).
+alignas(16) static uint8_t scenery_pixels[320*224];
+static uint16_t scenery_slot_idx[31];static uint8_t scenery_slot_of[8192];
+static uint32_t scenery_slot_overflow=0;   // colours not planned beyond the 31 slots (placed at once)
 static int scenery_low=224,scenery_high=0;
 static uint8_t scenery_map[8192];static const uint16_t*scenery_palette=0;
 static uint32_t scenery_diag[8];bool scenery_enabled=true;   // G key: roadside objects on/off (the car patterns are scheduled either way)
@@ -825,7 +874,55 @@ static uint32_t scenery_car_dropped=0,scenery_shared_total=0,scenery_frames=0,sc
 static unsigned scenery_peak=0,scenery_line_peak=0,scenery_block_peak=0;
 static uint32_t scenery_reuse_frames=0;   // r030
 uint32_t scenery_fine_total=0,scenery_fine_capture=0,scenery_fine_max=0,scenery_fine_colour=0,scenery_fine_tiles=0;
-static const unsigned SCENERY_LINE_BUDGET=96;   // longs per raster interrupt (two patterns + registers)
+// Longs a raster interrupt may write. One line period is 63.5 us and a long written to the PCG
+// with the sprite display on costs about 1.1 us on XEiJ (IOSPEED line of the report): with 96 a
+// quarter of the job lists finished after their tile row had begun (16 MHz, start scene), with
+// 64 none did. On the X68000 the start-up code measures the write time and sets the budget
+// (visuals_set_line_budget, 38 to 67); -DCBX68_BUDGET=N fixes it.
+#ifdef CBX68_BUDGET
+static const unsigned SCENERY_LINE_BUDGET=CBX68_BUDGET;
+void visuals_set_line_budget(unsigned){}
+#else
+static unsigned SCENERY_LINE_BUDGET=64;
+// 16 to 67 (67: never two whole patterns, 68 longs, charged to one line).
+void visuals_set_line_budget(unsigned longs){SCENERY_LINE_BUDGET=longs<16?16:longs>67?67:longs;}
+#endif
+unsigned visuals_line_budget(){return SCENERY_LINE_BUDGET;}
+// r031l "light" mode, for a slow bus. Sprite numbers and patterns used twice down the screen are
+// rewritten in the raster interrupts, and the start state put back, in every screen refresh a
+// picture is shown; on the real bus (1.9 us a long to the PCG) that took about a fifth of all
+// the time. In light mode a frame keeps only as many roadside tiles as there are patterns (after
+// the road's and the car's) plus SCENERY_LIGHT_REWRITES, the ones with the most pixels; the
+// others are left out before the numbers are given out.
+#ifndef CBX68_LIGHT_REWRITES
+#define CBX68_LIGHT_REWRITES 32
+#endif
+static unsigned SCENERY_LIGHT_REWRITES=CBX68_LIGHT_REWRITES;
+void visuals_set_light_rewrites(unsigned n){SCENERY_LIGHT_REWRITES=n;}
+static bool scenery_light=false;
+void visuals_set_light(bool on){scenery_light=on;}
+bool visuals_light(){return scenery_light;}
+#ifndef CBX68_REWRITTEN_FIRST
+#define CBX68_REWRITTEN_FIRST 1
+#endif
+static const bool SCENERY_REWRITTEN_FIRST=CBX68_REWRITTEN_FIRST;
+#ifndef CBX68_DIFF
+#define CBX68_DIFF 1
+#endif
+#ifndef CBX68_PACKET_REUSE
+#define CBX68_PACKET_REUSE 1
+#endif
+static const bool SCENERY_PACKET_REUSE=CBX68_PACKET_REUSE;static uint32_t scenery_packet_reuses=0;
+#ifndef CBX68_DIRTY_ROWS
+#define CBX68_DIRTY_ROWS 1
+#endif
+static const bool SCENERY_DIRTY_ROWS=CBX68_DIRTY_ROWS;static uint32_t scenery_partial_frames=0,scenery_full_why[3];
+#ifndef CBX68_FULL_FIRST
+#define CBX68_FULL_FIRST 1
+#endif
+static const bool SCENERY_FULL_FIRST=CBX68_FULL_FIRST;
+static const bool SCENERY_DIFF=CBX68_DIFF;   // a pattern rewritten by a line job: only the longs that differ from what it held
+static uint32_t scenery_start_longs=0,scenery_restart_longs=0,scenery_line_longs=0;   // job list sizes, summed over the frames
 #ifndef OR_X68K
 static unsigned scenery_entry_list[256],scenery_entry_count=0;
 static uint64_t scenery_dropped_pixels=0,scenery_pixels_total=0,scenery_shadow_pixels=0;
@@ -840,22 +937,98 @@ static uint32_t scenery_ref(SceneryPacket&S,unsigned off){
  (void)S;return off+1;
 #endif
 }
-struct SceneryJob{int16_t line;uint8_t pcg;uint8_t pad;uint16_t res,sprite;};
+struct SceneryJob{int16_t line;uint8_t pcg;uint8_t pad;uint16_t res,sprite;uint32_t mask;};   // mask: the longs of the pattern to write
+#ifdef OR_X68K
+extern "C" uint32_t scenery_tile_finish8(uint8_t*src,uint32_t rowbits,const uint32_t*rowLR,uint32_t*enc);
+extern "C" void scenery_tile_split8(uint8_t*src,uint32_t rowbits,uint32_t**encp);
+extern "C" uint32_t scenery_pcg_hash(const uint32_t*enc);
+extern "C" uint32_t scenery_tile_rows8_learn(const uint8_t*src,unsigned rows,uint32_t*rowLR,const uint16_t*block_bit,uint8_t*met_q);
+extern "C" uint32_t scenery_tile_rows8(const uint8_t*src,unsigned rows,uint32_t*rowLR,const uint16_t*block_bit);
+#ifdef CBX68_ASM_CHECK
+static uint32_t asm_check[8];static uint8_t chk_met[256];   // rows: calls, colour lookups left to C, mismatches; finish: calls, mismatches
+#endif
+#endif
 static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,const HudPacket&hud,bool sprites_on){
  S.count=S.kept=S.dropped=S.blocks=S.dropped_banks=S.reused=S.line_longs_max=S.shared=S.car_dropped=0;
- S.start_job=0;memset(S.line_job,0,sizeof S.line_job);
+ S.start_job=S.restart_job=0;memset(S.line_job,0,sizeof S.line_job);
  const bool car_hw=!car.overflow&&!car.text_mode;
  const unsigned car_sprites=car_hw?car.count:0,car_patterns=car_hw?car.patterns:0,car_blocks=car_hw?car.palettes:0;
  S.first_block=3+car_blocks;scenery_palette=pal;
  const unsigned block_limit=car_blocks<13?13-car_blocks:0;
+ static uint16_t bank_seen_mask[512];
+ // r030: a frame whose roadside sprites are the same as in the last computed frame (e.g.
+ // standing at the start) takes that frame's tiles instead of capturing and converting again.
+ // The key is what the picture is made from: the car's palette block count, and per sprite its
+ // 7 words, its 16 colours and the colours its bank has been seen to use (the plan's input).
+ const bool learn=(scenery_frames&7)==0;
+ enum {KEY_ENTRY=24};
+ static uint16_t reuse_key[256*KEY_ENTRY+8],reuse_new[256*KEY_ENTRY+8];static unsigned reuse_len=0;static bool reuse_valid=false;
+ unsigned key_len=0;bool key_ok=sprites_on&&scenery_enabled;
+ if(key_ok){
+  reuse_new[key_len++]=uint16_t(car_blocks);
+  for(unsigned i=0;i<osprites.sprite_count&&key_ok;i++){const osprite&e=osprites.sprite_entries[i];const uint16_t*r=e.data;
+   if((r[0]&0xd000)||((r[3]>>12)&3)!=3||scenery_is_car(e.scratch))continue;
+   if(key_len+KEY_ENTRY>sizeof reuse_new/2){key_ok=false;break;}
+   for(unsigned k=0;k<7;k++)reuse_new[key_len++]=r[k];
+   const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);for(unsigned n=0;n<16;n++)reuse_new[key_len++]=pal[base|n];
+   reuse_new[key_len++]=bank_seen_mask[base>>4];}
+ }
+ // tile rows of the kept frame whose colours have not been through a learning pass yet (r031b:
+ // a learning frame converts just those rows again; 0 = the kept frame can be taken as it is)
+ static uint32_t c_unlearned=0x3fff;
+ // r031b: the next changed frame must be a full pass (a partial one placed or dropped a colour
+ // outside the plan, or ran out of sprites: a full pass could do better)
+ static bool c_force_full=false;unsigned lookup_changes=0;
+ // the kept frame (r030), and for r031b where each tile row's sprites are in it and what it dropped
+ static uint16_t c_count,c_blocks,c_dropped,c_dropped_banks;static uint16_t c_palette[13][16];
+ static ScenerySprite c_sprite[SCENERY_MAX];static uint32_t c_hash[SCENERY_MAX];
+ // the kept frame's patterns: those of the frame built last (that frame is shown or waiting to be
+ // shown, never the one being built, so its patterns stay as they are; not copied any more)
+ static const uint32_t(*c_pcg)[32]=nullptr;
+ if(c_pcg==S.pcg)reuse_valid=false;   // (not reached: the frame built last is not this one)
+ static uint16_t c_row_start[15],c_row_dropped[14];static uint8_t c_bcount[13];
+ static uint16_t row_start[15],row_dropped[14];
+ // r031d: the palette block each bank had in the kept frame, and that frame's car block count
+ static uint16_t c_bank_id[512];static int8_t c_bank_blk[512];static unsigned c_bank_n=0,c_car_blocks=999;
+ static uint32_t packet_gen=0;   // changes whenever the roadside sprites of a frame differ from the frame before
+ const bool reuse=key_ok&&(!learn||!c_unlearned)&&reuse_valid&&key_len==reuse_len&&!memcmp(reuse_new,reuse_key,key_len*2);
+ // r031b: a frame that differs from the kept one in a few sprites only (e.g. the starter waving
+ // at the start): only the tile rows those sprites touch, in the kept frame or now, are drawn
+ // and converted again. The sprites of the other rows are taken from the kept frame, in the
+ // same order as a full pass gives them. For that the kept frame's palette must stay as it is:
+ // the plan below is then carried over from it (r031d) instead of made anew.
+ uint32_t dirty_rows=0;bool partial=false,want_carry=false;
+ if(SCENERY_DIRTY_ROWS&&key_ok&&!reuse&&reuse_valid&&!c_force_full&&!c_dropped&&c_car_blocks==car_blocks&&reuse_new[0]==reuse_key[0]){
+  auto mark=[&](const uint16_t*r){const int top=(r[0]&511)-256,rws=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rws-1:1-rws);
+   const int lo=std::min(top,bottom),hi=std::max(top,bottom);
+   if(hi<0||lo>223)return;
+   for(int ty=std::max(0,lo)>>4;ty<=std::min(223,hi)>>4;ty++)dirty_rows|=1u<<ty;};
+  // (the bank's seen colours, the last word of an entry, change nothing in the picture)
+  const unsigned n_new=(key_len-1)/KEY_ENTRY,n_old=(reuse_len-1)/KEY_ENTRY;
+  const uint16_t*const e_new=reuse_new+1,*const e_old=reuse_key+1;
+  if(n_new==n_old){
+   for(unsigned i=0;i<n_new;i++)if(memcmp(e_new+i*KEY_ENTRY,e_old+i*KEY_ENTRY,46)){mark(e_new+i*KEY_ENTRY);mark(e_old+i*KEY_ENTRY);}
+  }else{
+   // sprites came or went: the same ones at the front and at the back of the two lists are
+   // unchanged (and in the same order); everything between counts as changed
+   ++scenery_full_why[0];
+   unsigned p=0;const unsigned least=std::min(n_new,n_old);
+   while(p<least&&!memcmp(e_new+p*KEY_ENTRY,e_old+p*KEY_ENTRY,46))++p;
+   unsigned q=0;while(q<least-p&&!memcmp(e_new+(n_new-1-q)*KEY_ENTRY,e_old+(n_old-1-q)*KEY_ENTRY,46))++q;
+   for(unsigned i=p;i<n_new-q;i++)mark(e_new+i*KEY_ENTRY);
+   for(unsigned i=p;i<n_old-q;i++)mark(e_old+i*KEY_ENTRY);
+  }
+  if(learn)dirty_rows|=c_unlearned;   // a learning frame also takes the rows that still need it
+  // not worth it when most of the screen is touched
+  if(__builtin_popcount(dirty_rows)>12)++scenery_full_why[2];else want_carry=true;
+ }
  // Plan: the banks of this frame's entries, with the colours each was seen to use in earlier
  // frames (all 14 if never seen), packed by colour like r026 (largest first). Colours met that
  // were not planned are placed when met.
  unsigned nused=0,bcount[13]={0};
  static int8_t bank_block[512];static uint16_t bank_list[512];static uint8_t scenery_met[8192];unsigned nbank=0;
  if(!scenery_bank_init){memset(bank_block,-1,sizeof bank_block);scenery_bank_init=true;}
- static uint16_t bank_seen_mask[512];
- {static uint16_t plan_bank[128];unsigned np=0;
+ if(!reuse){static uint16_t plan_bank[128];unsigned np=0;   // (a frame that takes the kept tiles needs no plan)
   for(unsigned i=0;i<osprites.sprite_count;i++){const osprite&e=osprites.sprite_entries[i];const uint16_t*r=e.data;
    if(!sprites_on||!scenery_enabled||(r[0]&0xd000)||((r[3]>>12)&3)!=3||scenery_is_car(e.scratch))continue;
    unsigned bank=(COLOR_BASE_SCENERY>>4)+(r[5]&127);if(bank_block[bank]!=-1)continue;
@@ -864,6 +1037,39 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
   for(unsigned j=0;j<np;j++){unsigned bank=plan_bank[j],mask=bank_seen_mask[bank]?bank_seen_mask[bank]:0x7ffe;pn[j]=0;
    for(unsigned n=1;n<15;n++)if(mask&(1u<<n)){unsigned idx=bank*16+n;pidx[j][pn[j]]=uint16_t(idx);pcol[j][pn[j]]=pal[idx];pn[j]++;}
    order[j]=uint16_t(j);}
+  // r031d: carried plan. The kept frame's palette blocks stay as they are (so its tiles stay
+  // right); a bank keeps the block it had, colours it lacks are added to that block, a bank the
+  // kept frame did not have goes to the block that needs the fewest new colours. When something
+  // does not fit, the plan is made anew below and the whole picture is converted.
+  bool carried=false;
+  if(want_carry){
+   carried=true;
+   S.blocks=c_blocks;for(unsigned b=0;b<13;b++)bcount[b]=c_bcount[b];memcpy(S.palette,c_palette,sizeof c_palette);
+   static int8_t prev_blk[512];static bool prev_init=false;if(!prev_init){memset(prev_blk,-1,sizeof prev_blk);prev_init=true;}
+   for(unsigned k=0;k<c_bank_n;k++)prev_blk[c_bank_id[k]]=c_bank_blk[k];
+   for(unsigned j=0;j<np&&carried;j++){const unsigned bank=plan_bank[j];int blk=prev_blk[bank];
+    if(blk<0||unsigned(blk)>=S.blocks){
+     int best=-1;unsigned best_new=99;
+     for(unsigned b=0;b<S.blocks;b++){unsigned add=0;
+      for(unsigned c=0;c<pn[j];c++){bool dup=false;for(unsigned c2=0;c2<c;c2++)if(pcol[j][c2]==pcol[j][c]){dup=true;break;}
+       if(dup)continue;bool have=false;for(unsigned n=1;n<=bcount[b];n++)if(S.palette[b][n]==pcol[j][c]){have=true;break;}
+       if(!have)++add;}
+      if(bcount[b]+add<=15&&add<best_new){best=int(b);best_new=add;}}
+     if(best<0&&S.blocks<block_limit){best=S.blocks++;bcount[best]=0;}
+     if(best<0){carried=false;break;}
+     blk=best;}
+    for(unsigned c=0;c<pn[j];c++){unsigned n=1;for(;n<=bcount[blk];n++)if(S.palette[blk][n]==pcol[j][c])break;
+     if(n>bcount[blk]){if(bcount[blk]>=15){carried=false;break;}n=++bcount[blk];S.palette[blk][n]=pcol[j][c];}
+     scenery_map[pidx[j][c]]=uint8_t(((blk+1)<<4)|n);scenery_used[nused++]=pidx[j][c];}
+    if(carried)bank_block[bank]=int8_t(blk);}
+   for(unsigned k=0;k<c_bank_n;k++)prev_blk[c_bank_id[k]]=-1;
+   if(!carried){   // undo, then the plan from nothing
+    for(unsigned k=0;k<nused;k++)scenery_map[scenery_used[k]]=0;nused=0;
+    for(unsigned j=0;j<np;j++)bank_block[plan_bank[j]]=-2;
+    S.blocks=0;for(unsigned b=0;b<13;b++)bcount[b]=0;memset(S.palette,0,sizeof S.palette);++scenery_full_why[1];}
+  }
+  partial=carried;
+  if(!carried){
   std::sort(order,order+np,[](uint16_t a,uint16_t b){return pn[a]>pn[b]||(pn[a]==pn[b]&&a<b);});
   // r028: which blocks already hold a colour, as a small hash table colour -> block bits (same
   // choices as the r026e search over every block and colour, without the nested compares)
@@ -885,29 +1091,40 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
     scenery_map[pidx[j][c]]=uint8_t(((best+1)<<4)|n);scenery_used[nused++]=pidx[j][c];}
   }
   for(unsigned k=0;k<ch_n;k++)ch_used[ch_list[k]]=0;
+  }
  }
- // r030: a frame whose roadside sprites are the same as in the last computed frame (same
- // entries, palette plan and colours; e.g. standing at the start) takes that frame's tiles
- // instead of capturing and converting again (the same result). Not on colour-learning frames.
- const bool learn=(scenery_frames&7)==0;
- static uint16_t reuse_key[256*23+256],reuse_new[256*23+256];static unsigned reuse_len=0;static bool reuse_valid=false;
- unsigned key_len=0;bool key_ok=sprites_on&&scenery_enabled;
- if(key_ok){
-  reuse_new[key_len++]=uint16_t(car_blocks);reuse_new[key_len++]=S.blocks;
-  for(unsigned b=0;b<S.blocks;b++){reuse_new[key_len++]=uint16_t(bcount[b]);for(unsigned n=1;n<=bcount[b];n++)reuse_new[key_len++]=S.palette[b][n];}
-  for(unsigned i=0;i<osprites.sprite_count&&key_ok;i++){const osprite&e=osprites.sprite_entries[i];const uint16_t*r=e.data;
-   if((r[0]&0xd000)||((r[3]>>12)&3)!=3||scenery_is_car(e.scratch))continue;
-   if(key_len+23>sizeof reuse_new/2){key_ok=false;break;}
-   for(unsigned k=0;k<7;k++)reuse_new[key_len++]=r[k];
-   const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);for(unsigned n=0;n<16;n++)reuse_new[key_len++]=pal[base|n];}
- }
- const bool reuse=key_ok&&!learn&&reuse_valid&&key_len==reuse_len&&!memcmp(reuse_new,reuse_key,key_len*2);
  // 1. capture
 #ifdef OR_X68K
  uint32_t tc=platform_fine_clock();
 #endif
+ auto lookup=[&](unsigned v)->unsigned{
+  const unsigned idx=v&8191;unsigned q=scenery_map[idx];if(q)return q==255?0:q;
+  const unsigned bank=idx>>4;const uint16_t col=pal[idx];
+  if(bank_block[bank]==-1){bank_block[bank]=-2;bank_list[nbank++]=uint16_t(bank);}
+  int b=-1;int cur=bank_block[bank];
+  if(cur>=0){for(unsigned n=1;n<=bcount[cur];n++)if(S.palette[cur][n]==col){q=((cur+1)<<4)|n;break;}
+   if(!q&&bcount[cur]<15)b=cur;}
+  if(!q&&b<0){for(unsigned k=0;k<S.blocks&&!q;k++)for(unsigned n=1;n<=bcount[k];n++)if(S.palette[k][n]==col){q=((k+1)<<4)|n;break;}}
+  if(!q&&b<0){if(S.blocks<block_limit){b=S.blocks++;bcount[b]=0;}
+   else{unsigned room=0;for(unsigned k=0;k<S.blocks;k++)if(15-bcount[k]>room){room=15-bcount[k];b=int(k);}}}
+  if(!q&&b>=0){unsigned n=++bcount[b];S.palette[b][n]=col;q=((b+1)<<4)|n;bank_block[bank]=int8_t(b);++lookup_changes;}
+  if(!q){scenery_map[idx]=255;++S.dropped_banks;++lookup_changes;}else scenery_map[idx]=uint8_t(q);
+  scenery_used[nused++]=uint16_t(idx);
+  return q;};
+ // a colour not planned: its slot code for this frame (the tile pass places it, in pixel order)
+ unsigned nslot=0;
+ auto slot=[&](unsigned idx)->unsigned{
+  if(scenery_slot_of[idx])return scenery_slot_of[idx];
+  if(nslot<31){scenery_slot_idx[nslot]=uint16_t(idx);scenery_slot_of[idx]=uint8_t(0xe0+nslot);return 0xe0+nslot++;}
+  // no slot left (not met in the test run): placed now, before the tile pass, so it may take a
+  // palette entry ahead of a colour met earlier in the scan; a colour with no room is drawn as
+  // 0xff (covers what is under it, as the palette index did, and becomes no pixel)
+  ++scenery_slot_overflow;const unsigned q=lookup(idx);return q?q:0xff;};
  // r026c: the buffer is cleared by the tile pass (each non-empty 16-pixel run is zeroed after use)
  int low=224,high=0;
+ // tiles that a captured sprite may have drawn into (bit tx of row ty); the tile pass
+ // visits only these (a tile no sprite reached has no pixels: same result, no reads)
+ uint32_t tile_live[14]={0};
 #ifndef OR_X68K
  scenery_entry_count=0;
 #endif
@@ -920,11 +1137,16 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
   int top=(r[0]&511)-256,rows=(r[5]>>8)+1,bottom=top+((r[4]&0x8000)?rows-1:1-rows);
   low=std::min(low,std::min(top,bottom));high=std::max(high,std::max(top,bottom)+1);
   // r026e: drawn straight into palette-block codes ((block+1)<<4|index); colours not planned
-  // keep their palette index (>= 0x800) and are placed in the tile pass. Shadow pixels are left
+  // get a slot code (see scenery_pixels) and are placed in the tile pass. Shadow pixels are left
   // out (no darkening on the X68000).
-  if(!reuse){uint16_t table[16];const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);const bool shadow=(r[3]&0x4000)!=0;
-   for(unsigned k=0;k<16;k++){if(k==0||k==15||(shadow&&k==10)){table[k]=0;continue;}unsigned q=scenery_map[base|k];table[k]=uint16_t(q==255?0:q?q:(base|k));}
-   video.sprite_layer->capture_entry_table(r,scenery_pixels,table);}
+  bool draw_it=!reuse;
+  if(partial){const int lo=std::min(top,bottom),hi=std::max(top,bottom);draw_it=false;
+   if(hi>=0&&lo<=223)for(int ty=std::max(0,lo)>>4;ty<=std::min(223,hi)>>4;ty++)if(dirty_rows&(1u<<ty)){draw_it=true;break;}}
+  if(draw_it){uint16_t table[16];const unsigned base=COLOR_BASE_SCENERY+((r[5]&127)<<4);const bool shadow=(r[3]&0x4000)!=0;
+   for(unsigned k=0;k<16;k++){if(k==0||k==15||(shadow&&k==10)){table[k]=0;continue;}unsigned q=scenery_map[base|k];table[k]=uint16_t(q==255?0:q?q:slot(base|k));}
+   int xb[2]={320,-1};video.sprite_layer->capture_entry_table8(r,scenery_pixels,table,xb);
+   const int x0=std::max(0,xb[0]),x1=std::min(319,xb[1]),y0=std::max(0,std::min(top,bottom)),y1=std::min(223,std::max(top,bottom));
+   if(x0<=x1&&y0<=y1){const uint32_t cols=((2u<<(x1>>4))-1)&~((1u<<(x0>>4))-1);for(int ty=y0>>4;ty<=y1>>4;ty++)tile_live[ty]|=cols;}}
 #ifndef OR_X68K
   video.sprite_layer->capture_entry(r,scenery_std);
 #endif
@@ -958,21 +1180,9 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
 #ifndef OR_X68K
  static uint16_t check_copy[320*224];memcpy(check_copy,scenery_std,sizeof check_copy);scenery_check_pixels=check_copy;memset(scenery_std,0,sizeof scenery_std);
 #endif
- auto lookup=[&](unsigned v)->unsigned{
-  const unsigned idx=v&8191;unsigned q=scenery_map[idx];if(q)return q==255?0:q;
-  const unsigned bank=idx>>4;const uint16_t col=pal[idx];
-  if(bank_block[bank]==-1){bank_block[bank]=-2;bank_list[nbank++]=uint16_t(bank);}
-  int b=-1;int cur=bank_block[bank];
-  if(cur>=0){for(unsigned n=1;n<=bcount[cur];n++)if(S.palette[cur][n]==col){q=((cur+1)<<4)|n;break;}
-   if(!q&&bcount[cur]<15)b=cur;}
-  if(!q&&b<0){for(unsigned k=0;k<S.blocks&&!q;k++)for(unsigned n=1;n<=bcount[k];n++)if(S.palette[k][n]==col){q=((k+1)<<4)|n;break;}}
-  if(!q&&b<0){if(S.blocks<block_limit){b=S.blocks++;bcount[b]=0;}
-   else{unsigned room=0;for(unsigned k=0;k<S.blocks;k++)if(15-bcount[k]>room){room=15-bcount[k];b=int(k);}}}
-  if(!q&&b>=0){unsigned n=++bcount[b];S.palette[b][n]=col;q=((b+1)<<4)|n;bank_block[bank]=int8_t(b);}
-  if(!q){scenery_map[idx]=255;++S.dropped_banks;}else scenery_map[idx]=uint8_t(q);
-  scenery_used[nused++]=uint16_t(idx);
-  return q;};
  static uint32_t sprite_hash[SCENERY_MAX];
+ // longs of a pattern that are not 0 (kept with the sprite: read while the pattern is in the cache)
+ auto weight_of=[](const uint32_t*p)->uint8_t{unsigned w=0;for(unsigned q=0;q<32;q++)w+=p[q]!=0;return uint8_t(w);};
  // r026d: fast path for colours already placed; colours are learned on every 8th frame only;
  // pixel pairs that are both empty are skipped; one-block tiles are encoded without tests.
  static uint8_t met_q[256];
@@ -982,76 +1192,154 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
  // looked up in the same pixel order, and the patterns, hashes and sprite order are unchanged.
  static uint16_t block_bit[256];static bool block_bit_init=false;
  if(!block_bit_init){for(unsigned q=0;q<256;q++)block_bit[q]=uint16_t(q>=16?1u<<((q>>4)-1):0);block_bit_init=true;}
+#if defined(OR_X68K)&&defined(CBX68_ASM_CHECK)
+ const uint32_t chk_bails=asm_check[1];
+#endif
+ for(unsigned t=0;t<15;t++)row_start[t]=0;memset(row_dropped,0,sizeof row_dropped);
+ if(partial){
+  // (the palette is the kept frame's with this frame's additions: the carried plan)
+  S.dropped_banks=c_dropped_banks;
+  // sprites drawn for a dirty row also reach into other rows: those pixels are not wanted
+  for(int ty=0;ty<14;ty++)if(tile_live[ty]&&!(dirty_rows&(1u<<ty))){memset(scenery_pixels+ty*16*320,0,16*320);tile_live[ty]=0;}
+  ++scenery_partial_frames;
+ }
  if(!reuse)for(int ty=low/16;ty<(high+15)/16;ty++){
   const unsigned rows=unsigned(std::min(16,224-ty*16));
-  for(unsigned tx=0;tx<20;tx++){
-  uint32_t rowL[16],rowR[16];unsigned mask=0,rowbits=0;
-  uint16_t*const tile_src=scenery_pixels+ty*16*320+tx*16;
+  row_start[ty]=uint16_t(S.count);
+  if(partial&&!(dirty_rows&(1u<<ty))){   // the kept frame's sprites of this row
+   unsigned a=c_row_start[ty],n=unsigned(c_row_start[ty+1])-a;
+   if(S.count+n>SCENERY_MAX){const unsigned fit=SCENERY_MAX-S.count;S.dropped+=uint16_t(n-fit);scenery_overflow+=n-fit;row_dropped[ty]=uint16_t(n-fit);n=fit;}
+   memcpy(S.sprite+S.count,c_sprite+a,n*sizeof c_sprite[0]);memcpy(S.pcg+S.count,c_pcg+a,n*sizeof S.pcg[0]);memcpy(sprite_hash+S.count,c_hash+a,n*4);
+   for(unsigned k=0;k<n;k++)S.sprite[S.count+k].kept=0;
+   S.count=uint16_t(S.count+n);S.dropped=uint16_t(S.dropped+c_row_dropped[ty]);row_dropped[ty]=uint16_t(row_dropped[ty]+c_row_dropped[ty]);
+   continue;}
+  for(uint32_t live=tile_live[ty];live;live&=live-1){const unsigned tx=unsigned(__builtin_ctz(live));
+  uint32_t rowLR[32];uint32_t*const rowL=rowLR,*const rowR=rowLR+16;unsigned mask=0,rowbits=0;
+  uint8_t*const tile_src=scenery_pixels+ty*16*320+tx*16;
+  auto code=[&](unsigned q)->unsigned{return q<0xe0?q:q==0xff?0:lookup(scenery_slot_idx[q-0xe0]);};
+#ifdef OR_X68K
+  // asm first pass (scenery_tiles.S): whole tile, unless a colour still needs a lookup
+  bool rows_done=false;
+#ifdef CBX68_ASM_CHECK
+  uint32_t chkLR[32];uint32_t chk=0xffffffffu;
+  // (learn frames: the asm marks met_q on a copy, compared with the C marks at the end of the frame)
+  {chk=learn?scenery_tile_rows8_learn(tile_src,rows,chkLR,block_bit,chk_met):scenery_tile_rows8(tile_src,rows,chkLR,block_bit);++asm_check[0];if(chk==0xffffffffu)++asm_check[1];}
+#else
+  {const uint32_t rv=learn?scenery_tile_rows8_learn(tile_src,rows,rowLR,block_bit,met_q):scenery_tile_rows8(tile_src,rows,rowLR,block_bit);
+   if(rv!=0xffffffffu){mask=rv&0xffff;rowbits=rv>>16;rows_done=true;}}
+#endif
+  if(!rows_done)
+#endif
   for(unsigned yy=0;yy<rows;yy++){
-   uint16_t*src=tile_src+yy*320;alias_u32*s32=(alias_u32*)src;
-   if(!(s32[0]|s32[1]|s32[2]|s32[3]|s32[4]|s32[5]|s32[6]|s32[7])){rowL[yy]=rowR[yy]=0;continue;}
+   uint8_t*src=tile_src+yy*320;alias_u32*s32=(alias_u32*)src;
+   if(!(s32[0]|s32[1]|s32[2]|s32[3])){rowL[yy]=rowR[yy]=0;continue;}
    uint32_t a=0,b=0;
    for(unsigned xx=0;xx<8;xx+=2){unsigned q0=0,q1=0;
-    if(s32[xx>>1]){q0=src[xx];q1=src[xx+1];
-     if(q0>=256)q0=lookup(q0);   // a colour that was not planned (same order as before)
-     if(q1>=256)q1=lookup(q1);
+    if(src[xx]|src[xx+1]){q0=code(src[xx]);q1=code(src[xx+1]);   // (a colour not planned is placed here, in pixel order)
      mask|=block_bit[q0]|block_bit[q1];
      if(learn){met_q[q0]=1;met_q[q1]=1;}}
     a=(a<<8)|((q0&15)<<4)|(q1&15);}
    for(unsigned xx=8;xx<16;xx+=2){unsigned q0=0,q1=0;
-    if(s32[xx>>1]){q0=src[xx];q1=src[xx+1];
-     if(q0>=256)q0=lookup(q0);
-     if(q1>=256)q1=lookup(q1);
+    if(src[xx]|src[xx+1]){q0=code(src[xx]);q1=code(src[xx+1]);
      mask|=block_bit[q0]|block_bit[q1];
      if(learn){met_q[q0]=1;met_q[q1]=1;}}
     b=(b<<8)|((q0&15)<<4)|(q1&15);}
    rowL[yy]=a;rowR[yy]=b;rowbits|=1u<<yy;}
+#if defined(OR_X68K)&&defined(CBX68_ASM_CHECK)
+  if(chk!=0xffffffffu){bool bad=chk!=((uint32_t(rowbits)<<16)|mask);
+   for(unsigned yy=0;yy<rows&&!bad;yy++)bad=chkLR[yy]!=rowL[yy]||chkLR[yy+16]!=rowR[yy];
+   if(bad)++asm_check[2];}
+#endif
   if(!mask){   // r028 fix: pixels whose colour was dropped (no palette room) are cleared too
-   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=0;}
    continue;}
   for(unsigned yy=rows;yy<16;yy++)rowL[yy]=rowR[yy]=0;
   if(!(mask&(mask-1))){   // one block: the nibbles are the pattern
    const unsigned bnum=unsigned(__builtin_ctz(mask));
-   if(S.count>=SCENERY_MAX){++S.dropped;++scenery_overflow;
-    for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   if(S.count>=SCENERY_MAX){++S.dropped;++row_dropped[ty];++scenery_overflow;
+    for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=0;}
     continue;}
    ScenerySprite&sp=S.sprite[S.count];uint32_t*enc=S.pcg[S.count];
    sp.x=int16_t(tx*16+16);sp.y=int16_t(ty*16+16);sp.block=uint8_t(bnum);sp.row=uint8_t(ty);sp.kept=0;
+#if defined(OR_X68K)&&!defined(CBX68_ASM_CHECK)
+   sprite_hash[S.count]=scenery_tile_finish8(tile_src,rowbits,rowLR,enc);sp.weight=weight_of(rowLR);++S.count;
+   continue;
+#endif
    uint32_t h=2166136261UL;
    for(unsigned yy=0;yy<16;yy++){const uint32_t l=rowL[yy],r=rowR[yy];enc[yy]=l;enc[yy+16]=r;h^=l;h*=16777619UL;h^=r;h*=16777619UL;}
-   sprite_hash[S.count]=h;++S.count;
-   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+#if defined(OR_X68K)&&defined(CBX68_ASM_CHECK)
+   {static uint8_t chk_px[16*16];uint32_t chk_enc[32];for(unsigned yy=0;yy<rows;yy++)memcpy(chk_px+yy*16,tile_src+yy*320,16);
+    // run the asm on the real rows, then compare hash, pattern and that exactly the rows in rowbits were cleared
+    const uint32_t ah=scenery_tile_finish8(tile_src,rowbits,rowLR,chk_enc);++asm_check[3];
+    bool bad=ah!=h||memcmp(chk_enc,enc,sizeof chk_enc);
+    for(unsigned yy=0;yy<rows&&!bad;yy++)for(unsigned xx=0;xx<16;xx++){const uint8_t want=(rowbits&(1u<<yy))?0:chk_px[yy*16+xx];if(tile_src[yy*320+xx]!=want){bad=true;break;}}
+    if(bad)++asm_check[4];}
+#endif
+   sprite_hash[S.count]=h;sp.weight=weight_of(rowLR);++S.count;
+   for(unsigned yy=0;yy<rows;yy++)if(rowbits&(1u<<yy)){alias_u32*s32=(alias_u32*)(tile_src+yy*320);s32[0]=s32[1]=s32[2]=s32[3]=0;}
    continue;}
   // several blocks: one sprite per block, in block order (dropped when the list is full)
   unsigned ord[16],blocks_here[16],nb=0;
   for(unsigned b=0,mm=mask;mm;b++,mm>>=1)if(mm&1){ord[b+1]=nb;blocks_here[nb++]=b;}
   unsigned first=S.count,take=0;
-  for(unsigned j=0;j<nb;j++){if(S.count>=SCENERY_MAX){++S.dropped;++scenery_overflow;continue;}++S.count;++take;}
+  for(unsigned j=0;j<nb;j++){if(S.count>=SCENERY_MAX){++S.dropped;++row_dropped[ty];++scenery_overflow;continue;}++S.count;++take;}
   uint32_t hj[16];for(unsigned j=0;j<take;j++){hj[j]=2166136261UL;
    ScenerySprite&sp=S.sprite[first+j];sp.x=int16_t(tx*16+16);sp.y=int16_t(ty*16+16);sp.block=uint8_t(blocks_here[j]);sp.row=uint8_t(ty);sp.kept=0;}
+#ifdef OR_X68K
+#ifdef CBX68_ASM_CHECK
+  // asm second pass on a copy of the tile; compared with the C result below
+  alignas(4) static uint8_t split_px[16*320];static uint32_t split_enc[16][32];uint32_t split_hash[16];
+  const bool split_chk=chk!=0xffffffffu&&take==nb;
+  if(split_chk){uint32_t*encp[16];for(unsigned yy=0;yy<rows;yy++)memcpy(split_px+yy*320,tile_src+yy*320,16);
+   for(unsigned j=0;j<nb;j++){memset(split_enc[j],0,128);encp[blocks_here[j]+1]=split_enc[j];}
+   scenery_tile_split8(split_px,rowbits,encp);for(unsigned j=0;j<nb;j++)split_hash[j]=scenery_pcg_hash(split_enc[j]);++asm_check[5];}
+#else
+  if(rows_done&&take==nb){uint32_t*encp[16];
+   for(unsigned j=0;j<nb;j++){memset(S.pcg[first+j],0,128);encp[blocks_here[j]+1]=S.pcg[first+j];}
+   scenery_tile_split8(tile_src,rowbits,encp);
+   for(unsigned j=0;j<nb;j++){sprite_hash[first+j]=scenery_pcg_hash(S.pcg[first+j]);S.sprite[first+j].weight=weight_of(S.pcg[first+j]);}
+   continue;}
+#endif
+#endif
   for(unsigned yy=0;yy<16;yy++){uint32_t lj[16]={0},rj[16]={0};
-   if(rowbits&(1u<<yy)){uint16_t*src=tile_src+yy*320;   // read again: every colour is placed by now
-    for(unsigned xx=0;xx<8;xx++){unsigned q=src[xx];if(q>=256)q=lookup(q);if(q){unsigned j=ord[q>>4];lj[j]|=uint32_t(q&15)<<(28-4*xx);}
-     q=src[xx+8];if(q>=256)q=lookup(q);if(q){unsigned j=ord[q>>4];rj[j]|=uint32_t(q&15)<<(28-4*xx);}}
-    alias_u32*s32=(alias_u32*)src;s32[0]=s32[1]=s32[2]=s32[3]=s32[4]=s32[5]=s32[6]=s32[7]=0;}
+   if(rowbits&(1u<<yy)){uint8_t*src=tile_src+yy*320;   // read again: every colour is placed by now
+    for(unsigned xx=0;xx<8;xx++){unsigned q=code(src[xx]);if(q){unsigned j=ord[q>>4];lj[j]|=uint32_t(q&15)<<(28-4*xx);}
+     q=code(src[xx+8]);if(q){unsigned j=ord[q>>4];rj[j]|=uint32_t(q&15)<<(28-4*xx);}}
+    alias_u32*s32=(alias_u32*)src;s32[0]=s32[1]=s32[2]=s32[3]=0;}
    for(unsigned j=0;j<take;j++){uint32_t*enc=S.pcg[first+j];enc[yy]=lj[j];enc[yy+16]=rj[j];hj[j]^=lj[j];hj[j]*=16777619UL;hj[j]^=rj[j];hj[j]*=16777619UL;}}
-  for(unsigned j=0;j<take;j++)sprite_hash[first+j]=hj[j];
+  for(unsigned j=0;j<take;j++){sprite_hash[first+j]=hj[j];S.sprite[first+j].weight=weight_of(S.pcg[first+j]);}
+#if defined(OR_X68K)&&defined(CBX68_ASM_CHECK)
+  if(split_chk){bool bad=false;for(unsigned j=0;j<nb;j++)if(split_hash[j]!=hj[j]||memcmp(split_enc[j],S.pcg[first+j],128))bad=true;
+   for(unsigned yy=0;yy<rows&&!bad;yy++)if(rowbits&(1u<<yy))for(unsigned xx=0;xx<16;xx++)if(split_px[yy*320+xx])bad=true;
+   if(bad)++asm_check[6];}
+#endif
   }
  }
+ if(!reuse)for(int t=(high+15)/16;t<15;t++)if(t>=0)row_start[t]=uint16_t(S.count);
+ for(unsigned k=0;k<nslot;k++)scenery_slot_of[scenery_slot_idx[k]]=0;
  // learn which colours each bank uses (planned and met), then clear the tables
  for(unsigned k=0;k<nused;k++){unsigned idx=scenery_used[k],q=scenery_map[idx];if(learn&&q&&q!=255&&met_q[q])bank_seen_mask[idx>>4]|=uint16_t(1u<<(idx&15));scenery_map[idx]=0;}
+#if defined(OR_X68K)&&defined(CBX68_ASM_CHECK)
+ // asm marks must be C marks; with no tile handed back to C this frame they must be all of them
+ if(learn){bool bad=false;for(unsigned q=1;q<0xe0;q++)if(chk_met[q]?!met_q[q]:(met_q[q]&&chk_bails==asm_check[1]))bad=true;
+  ++asm_check[7];if(bad)++asm_check[2];memset(chk_met,0,sizeof chk_met);}
+#endif
  if(learn)memset(met_q,0,sizeof met_q);
+ if(!reuse&&key_ok){c_bank_n=nbank;for(unsigned k=0;k<nbank;k++){c_bank_id[k]=bank_list[k];c_bank_blk[k]=bank_block[bank_list[k]];}c_car_blocks=car_blocks;}
  for(unsigned k=0;k<nbank;k++)bank_block[bank_list[k]]=-1;
  for(unsigned b=0;b<S.blocks;b++)for(unsigned n=bcount[b]+1;n<16;n++)S.palette[b][n]=0;
  // r030: keep this frame's tiles for a frame with the same sprites, or take the kept ones
- {static uint16_t c_count,c_blocks,c_dropped,c_dropped_banks;static uint16_t c_palette[13][16];
-  static ScenerySprite c_sprite[SCENERY_MAX];static uint32_t c_pcg[SCENERY_MAX][32],c_hash[SCENERY_MAX];
+ {
   if(reuse){S.count=c_count;S.blocks=c_blocks;S.dropped=c_dropped;S.dropped_banks=c_dropped_banks;memcpy(S.palette,c_palette,sizeof c_palette);
-   memcpy(S.sprite,c_sprite,S.count*sizeof c_sprite[0]);memcpy(S.pcg,c_pcg,S.count*sizeof c_pcg[0]);memcpy(sprite_hash,c_hash,S.count*4);++scenery_reuse_frames;}
+   memcpy(S.sprite,c_sprite,S.count*sizeof c_sprite[0]);memcpy(S.pcg,c_pcg,S.count*sizeof S.pcg[0]);c_pcg=S.pcg;memcpy(sprite_hash,c_hash,S.count*4);++scenery_reuse_frames;}
   else if(key_ok){c_count=S.count;c_blocks=S.blocks;c_dropped=S.dropped;c_dropped_banks=S.dropped_banks;memcpy(c_palette,S.palette,sizeof c_palette);
-   memcpy(c_sprite,S.sprite,S.count*sizeof c_sprite[0]);memcpy(c_pcg,S.pcg,S.count*sizeof c_pcg[0]);memcpy(c_hash,sprite_hash,S.count*4);
-   memcpy(reuse_key,reuse_new,key_len*2);reuse_len=key_len;reuse_valid=true;}
-  else reuse_valid=false;}
+   memcpy(c_sprite,S.sprite,S.count*sizeof c_sprite[0]);c_pcg=S.pcg;memcpy(c_hash,sprite_hash,S.count*4);
+   memcpy(c_row_start,row_start,sizeof c_row_start);memcpy(c_row_dropped,row_dropped,sizeof c_row_dropped);for(unsigned b=0;b<13;b++)c_bcount[b]=uint8_t(bcount[b]);
+   memcpy(reuse_key,reuse_new,key_len*2);reuse_len=key_len;reuse_valid=true;
+   c_unlearned=learn?0:partial?(c_unlearned|dirty_rows):0x3fff;
+   c_force_full=partial&&(lookup_changes||S.dropped);}
+  else reuse_valid=false;
+  if(!reuse)++packet_gen;}   // the sprites of this frame are not the kept ones any more
 #ifdef OR_X68K
  uint32_t ts=platform_fine_clock();scenery_fine_tiles+=ts-tp;
 #endif
@@ -1062,27 +1350,125 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
  const unsigned nS=128>car_sprites?128-car_sprites:0,nP=cap_p;
  static int8_t s_last[128],p_last[256];static int16_t p_content[256];static uint32_t p_hash[256];
  for(unsigned k=0;k<nS;k++)s_last[k]=-100;for(unsigned k=0;k<nP;k++){p_last[k]=-100;p_content[k]=-1;}
+ // resident patterns by hash (64 chains), so a tile finds a pattern with the same pixels
+ // without testing every resident one. The lowest matching number is taken, as before.
+ static int16_t p_chain_head[64],p_chain_next[256];for(unsigned b=0;b<64;b++)p_chain_head[b]=-1;
+ auto chain_of=[](uint32_t h)->unsigned{return (h^(h>>6)^(h>>12)^(h>>18)^(h>>24))&63;};
  unsigned fresh_s=0,fresh_p=0;
- static uint16_t sq[256],pq[512];static int8_t pq_last[512];unsigned sq_h=0,sq_t=0,pq_h=0,pq_t=0;
- int room4=0,room34=0;
+ static uint16_t sq[256];unsigned sq_h=0,sq_t=0;
+ // Patterns free for another tile, oldest first, in two queues: [0] those a line job has already
+ // rewritten in this frame, [1] those still holding their start state. [0] is asked first, so the
+ // rewriting stays on few patterns and the others need no reload when the frame is shown again.
+ static uint16_t pq[2][512];static int8_t pq_last[2][512];unsigned pq_h[2]={0,0},pq_t[2]={0,0};
+ int room=0;   // every line before it is full
  static uint16_t line_load[SCENERY_LINES];memset(line_load,0,sizeof line_load);
+ static uint8_t s_rewritten[128],p_rewritten[256];memset(s_rewritten,0,sizeof s_rewritten);memset(p_rewritten,0,sizeof p_rewritten);   // has a line job
  // r027: text palette of each score/time band after the first, in the empty text row above it
  static int16_t hud_line[28];
  for(unsigned b=1;b<hud.bands;b++){hud_line[b]=int16_t(hud.band_first[b]*8-4);line_load[hud_line[b]]+=10;}
- auto find_line=[&](int from,int z,unsigned need,int&ptr)->int{int l=std::max(from,ptr);const bool at=l==ptr;
-  for(;l<=z;l++){if(line_load[l]+need<=SCENERY_LINE_BUDGET)return l;if(at)ptr=l+1;}return -1;};
+ // r031g: a job starts at the first line from `from` that has room and may run on into the lines
+ // after it (the raster interrupts of those lines come in while it is written, and their own jobs
+ // wait). It is charged to those lines up to the budget each, and must be done by line z. So the
+ // budget is what one line period can take on average, and a job longer than that (a whole
+ // pattern on a slow bus) still gets placed. Returns the start line, or -1; what was charged is
+ // kept in place_l/place_n for place_undo().
+ static int16_t place_l[SCENERY_LINES];static uint8_t place_n[SCENERY_LINES];unsigned place_count=0;
+ // #62: the car's tiles may go over the budget (twice it) when they do not fit: there are few of
+ // them, and a car tile left out shows as a hole in the car. `cap` is the budget of the call.
+ unsigned cap=SCENERY_LINE_BUDGET;
+ auto place=[&](int from,int z,unsigned need)->int{
+  int l=cap==SCENERY_LINE_BUDGET?std::max(from,room):from;
+  while(l<=z&&line_load[l]>=cap){if(l==room&&cap==SCENERY_LINE_BUDGET)room=l+1;++l;}
+  if(l>z)return -1;
+  unsigned room_sum=0;for(int k=l;k<=z&&room_sum<need;k++)if(line_load[k]<cap)room_sum+=cap-line_load[k];
+  if(room_sum<need)return -1;
+  place_count=0;unsigned rem=need;
+  for(int k=l;rem;k++){if(line_load[k]>=cap)continue;
+   const unsigned f=std::min<unsigned>(cap-line_load[k],rem);
+   line_load[k]=uint16_t(line_load[k]+f);rem-=f;place_l[place_count]=int16_t(k);place_n[place_count++]=uint8_t(f);}
+  return l;};
+ auto place_undo=[&](const int16_t*pl,const uint8_t*pn,unsigned count){for(unsigned k=0;k<count;k++){line_load[pl[k]]=uint16_t(line_load[pl[k]]-pn[k]);if(pl[k]<room)room=pl[k];}};
  static SceneryJob jobs[2*(SCENERY_MAX+128)];unsigned njobs=0;
  static uint16_t p_of[SCENERY_MAX+128];
  // users: car tiles (index SCENERY_MAX+i) and roadside sprites, row by row, car first
  static uint16_t users[SCENERY_MAX+128];unsigned nu=0;
- for(unsigned row=0;row<14;row++){
-  for(unsigned i=0;i<car_sprites;i++)if(unsigned(car.registers[i][1]-16)/16==row)users[nu++]=uint16_t(SCENERY_MAX+i);
-  for(unsigned i=0;i<S.count;i++)if(S.sprite[i].row==row)users[nu++]=uint16_t(i);
+ // one counting pass instead of one pass per row (same order: car tiles, then the rest)
+ static uint8_t left_out[SCENERY_MAX];
+ if(scenery_light){   // keep the tiles with the most pixels (see SCENERY_LIGHT_REWRITES)
+  static uint8_t weight[SCENERY_MAX];unsigned count[34]={0};
+  for(unsigned i=0;i<S.count;i++){const unsigned w=S.sprite[i].weight;weight[i]=uint8_t(w);++count[w];}
+  const unsigned room=(nP>car_sprites?nP-car_sprites:0)+SCENERY_LIGHT_REWRITES;
+  unsigned kept=0;int cut=33;   // tiles of weight >= cut are kept; of weight cut-1 as many as still fit
+  while(cut>0&&kept+count[cut-1]<=room){--cut;kept+=count[cut];}
+  unsigned more=cut>0?room-kept:0;
+  for(unsigned i=0;i<S.count;i++){const unsigned w=weight[i];
+   if(int(w)>=cut)left_out[i]=0;else if(int(w)==cut-1&&more){left_out[i]=0;--more;}else{left_out[i]=1;++S.dropped;}}
+ }else memset(left_out,0,S.count);
+ {unsigned start[15]={0};uint8_t car_row[128];
+  for(unsigned i=0;i<car_sprites;i++){const unsigned r=unsigned(car.registers[i][1]-16)/16;car_row[i]=uint8_t(r<14?r:14);if(r<14)++start[r+1];}
+  for(unsigned i=0;i<S.count;i++)if(S.sprite[i].row<14&&!left_out[i])++start[S.sprite[i].row+1];
+  for(unsigned r=1;r<15;r++)start[r]+=start[r-1];
+  nu=start[14];
+  unsigned car_end[14];for(unsigned r=0;r<14;r++)car_end[r]=start[r];
+  for(unsigned i=0;i<car_sprites;i++)if(car_row[i]<14)users[car_end[car_row[i]]++]=uint16_t(SCENERY_MAX+i);
+  for(unsigned i=0;i<S.count;i++){const unsigned r=S.sprite[i].row;if(r<14&&!left_out[i])users[car_end[r]++]=uint16_t(i);}
+  // r031e: within a tile row the fullest tiles come first, so what does not fit any more (the
+  // row's line budget for pattern loads) are the tiles with the fewest pixels. Only rows that
+  // can run short are sorted (more tiles than the 10 lines after the row before can load).
+  if(SCENERY_FULL_FIRST){static uint8_t weight[SCENERY_MAX];
+   for(unsigned r=0;r<14;r++){const unsigned a0=car_end[r]-0,b0=start[r+1];unsigned first=start[r];
+    while(first<b0&&users[first]>=SCENERY_MAX)++first;   // after the car's tiles
+    (void)a0;if(b0-first<12)continue;
+    for(unsigned k=first;k<b0;k++)weight[users[k]]=S.sprite[users[k]].weight;
+    for(unsigned k=first+1;k<b0;k++){const uint16_t u=users[k];const unsigned w=weight[u];unsigned j=k;
+     while(j>first&&weight[users[j-1]]<w){users[j]=users[j-1];--j;}
+     users[j]=u;}}
+  }
  }
  static uint32_t car_pcg32[128][32];
- for(unsigned i=0;i<car_sprites;i++){const uint8_t*b=car.pcg[car.pattern_index[i]];for(unsigned q=0;q<32;q++)car_pcg32[i][q]=(uint32_t(b[q*4])<<24)|(uint32_t(b[q*4+1])<<16)|(uint32_t(b[q*4+2])<<8)|b[q*4+3];}
+ for(unsigned i=0;i<car_sprites;i++){const uint8_t*b=car.pcg[car.pattern_index[i]];
+#if defined(__BYTE_ORDER__)&&__BYTE_ORDER__==__ORDER_BIG_ENDIAN__
+  memcpy(car_pcg32[i],b,128);   // the bytes already are the big-endian longs
+#else
+  for(unsigned q=0;q<32;q++)car_pcg32[i][q]=(uint32_t(b[q*4])<<24)|(uint32_t(b[q*4+1])<<16)|(uint32_t(b[q*4+2])<<8)|b[q*4+3];
+#endif
+ }
+ // r031: the whole packet of the frame before, when everything the steps below read is the same:
+ // the roadside sprites (packet_gen), the car's sprites and patterns, the score palettes. The
+ // numbers, patterns and job lists then come out the same, so they are copied (the lists with
+ // their addresses moved to this frame) instead of worked out again.
+ static uint32_t last_sig=0;static bool last_ok=false;static const SceneryPacket*last_S=0;static unsigned last_used=0;
+ static int32_t o_start=0,o_restart=0,o_line[224];static uint16_t o_head[6];static uint8_t o_kept[SCENERY_MAX];
+ static uint16_t o_car2[128],o_car3[128];static uint32_t o_longs[3];
+ uint32_t sig=2166136261UL;
+ {auto mix=[&](uint32_t x){sig^=x;sig*=16777619UL;};
+  mix(packet_gen);mix(car_sprites);mix(SCENERY_LINE_BUDGET);mix(scenery_light?1+SCENERY_LIGHT_REWRITES:0);
+  for(unsigned i=0;i<car_sprites;i++){mix(car.registers[i][0]);mix(car.registers[i][1]);mix(car.registers[i][2]&0xff00u);mix(car.registers[i][3]);
+   for(unsigned q=0;q<32;q++)mix(car_pcg32[i][q]);}
+  mix(hud.active);mix(hud.bands);for(unsigned b=0;b<hud.bands;b++){mix(hud.band_first[b]);for(unsigned q=0;q<16;q++)mix(hud.band_pal[b][q]);}}
+ if(SCENERY_PACKET_REUSE&&reuse&&last_ok&&sig==last_sig){
+  S.kept=o_head[0];S.dropped=o_head[1];S.reused=o_head[2];S.line_longs_max=o_head[3];S.shared=o_head[4];S.car_dropped=o_head[5];
+  for(unsigned i=0;i<S.count;i++)S.sprite[i].kept=o_kept[i];
+  for(unsigned i=0;i<car_sprites;i++){car.registers[i][2]=o_car2[i];car.registers[i][3]=o_car3[i];}
+  if(last_S!=&S)memcpy(S.jobs,last_S->jobs,last_used*4);
+  S.start_job=scenery_ref(S,unsigned(o_start));S.restart_job=scenery_ref(S,unsigned(o_restart));
+  for(unsigned l=0;l<224;l++)if(o_line[l]>=0)S.line_job[l]=scenery_ref(S,unsigned(o_line[l]));
+  scenery_start_longs+=o_longs[0];scenery_restart_longs+=o_longs[1];scenery_line_longs+=o_longs[2];
+  last_S=&S;++scenery_packet_reuses;
+  return;
+ }
+ last_ok=false;
  auto pcg_of=[&](unsigned u)->const uint32_t*{return u>=SCENERY_MAX?car_pcg32[u-SCENERY_MAX]:S.pcg[u];};
  auto content_id=[&](unsigned u)->int{return u>=SCENERY_MAX?int(SCENERY_MAX+car.pattern_index[u-SCENERY_MAX]):int(u);};
+ // the longs that differ between two patterns, and what writing them costs (2 a run + the data)
+ // A mask in many short runs can cost more than the whole pattern (34): then the whole pattern.
+ // (longs and runs are counted while the mask is made: no population count call on the 68k)
+ unsigned diff_cost=34;
+ auto diff_mask=[&](const uint32_t*a,const uint32_t*b)->uint32_t{
+  uint32_t m=0;unsigned longs=0,runs=0,prev=0;
+  for(int q=31;q>=0;q--){const unsigned ne=a[q]!=b[q];m=(m<<1)|ne;longs+=ne;runs+=ne&~prev;prev=ne;}
+  diff_cost=longs+2*runs;if(diff_cost>34){diff_cost=34;return 0xffffffffu;}
+  return m;};
  S.car_dropped=0;
  for(unsigned q=0;q<nu;q++){const unsigned u=users[q];const bool is_car=u>=SCENERY_MAX;
   const int r=is_car?int(car.registers[u-SCENERY_MAX][1]-16)/16:S.sprite[u].row;
@@ -1094,79 +1480,131 @@ static void build_scenery_body(SceneryPacket&S,const uint16_t*pal,CarPacket&car,
    else if(sq_h!=sq_t&&s_last[sq[sq_h&255]]<=r-2){sn=sq[sq_h&255];sre=true;}
   }
   // a resident pattern with the same pixels
-  for(unsigned k=0;k<fresh_p&&pn<0;k++)if(p_hash[k]==hash&&p_content[k]>=0&&!memcmp(pcg_of(unsigned(p_content[k])),mine,128)){pn=k;shared=true;}
+  for(int k=p_chain_head[chain_of(hash)];k>=0;k=p_chain_next[k])
+   if(p_hash[k]==hash&&(pn<0||k<pn)&&!memcmp(pcg_of(unsigned(p_content[k])),mine,128)){pn=k;shared=true;}
   if(pn<0&&fresh_p<nP)pn=int(fresh_p);
+  // oldest first; one whose last row grew by sharing goes to the back again
+  auto peek=[&](unsigned q)->int{
+   for(unsigned guard=0;pq_h[q]!=pq_t[q]&&guard<512;guard++){const unsigned k=pq[q][pq_h[q]&511];
+    if(p_last[k]!=pq_last[q][pq_h[q]&511]){pq[q][pq_t[q]&511]=uint16_t(k);pq_last[q][pq_t[q]&511]=p_last[k];++pq_t[q];++pq_h[q];continue;}
+    return p_last[k]<=r-2?int(k):-1;}
+   return -1;};
+  uint32_t pmask=0xffffffffu;unsigned pneed=34;
+  int cand[2]={-1,-1};
+  if(pn<0){cand[0]=SCENERY_REWRITTEN_FIRST?peek(0):-1;cand[1]=peek(1);}
+  auto drop=[&]{if(is_car){++S.car_dropped;car.registers[u-SCENERY_MAX][3]=0;}else ++S.dropped;};
+  if((!is_car&&sn<0)||(pn<0&&cand[0]<0&&cand[1]<0)){drop();continue;}
+  int ls=-1,lp=-1,from_q=-1;const int z=16*r-3;
+  int16_t s_pl[4];uint8_t s_pn[4];unsigned s_count=0;   // what the sprite's 4 longs were charged to
+  if(sre){ls=place(16*(s_last[sn]+1)+3,z,4);if(ls<0){drop();continue;}
+   s_count=place_count;for(unsigned k=0;k<s_count;k++){s_pl[k]=place_l[k];s_pn[k]=place_n[k];}}
   if(pn<0){
-   // oldest first; one whose last row grew by sharing goes to the back again
-   for(unsigned guard=0;pq_h!=pq_t&&guard<512&&pn<0;guard++){unsigned k=pq[pq_h&511];
-    if(p_last[k]!=pq_last[pq_h&511]){pq[pq_t&511]=uint16_t(k);pq_last[pq_t&511]=p_last[k];++pq_t;++pq_h;continue;}
-    if(p_last[k]<=r-2){pn=int(k);pre=true;}else break;}
+   for(unsigned q=0;q<2&&pn<0;q++){if(cand[q]<0)continue;
+    diff_cost=34;const uint32_t m=SCENERY_DIFF?diff_mask(pcg_of(unsigned(p_content[cand[q]])),mine):0xffffffffu;const unsigned need=diff_cost;
+    lp=place(16*(p_last[cand[q]]+1)+3,z,need);
+    if(lp<0&&is_car){cap=2*SCENERY_LINE_BUDGET;lp=place(16*(p_last[cand[q]]+1)+3,z,need);cap=SCENERY_LINE_BUDGET;}
+    if(lp>=0){pn=cand[q];pre=true;from_q=int(q);pmask=m;pneed=need;}}
+   if(pn<0){if(sre)place_undo(s_pl,s_pn,s_count);drop();continue;}
   }
-  if((!is_car&&sn<0)||pn<0){if(is_car){++S.car_dropped;car.registers[u-SCENERY_MAX][3]=0;}else ++S.dropped;continue;}
-  int ls=-1,lp=-1;
-  if(sre||pre){
-   const int z=16*r-3;
-   if(sre)ls=find_line(16*(s_last[sn]+1)+3,z,4,room4);
-   if(sre&&ls<0){if(is_car){++S.car_dropped;car.registers[u-SCENERY_MAX][3]=0;}else ++S.dropped;continue;}
-   if(sre)line_load[ls]+=4;
-   if(pre)lp=find_line(16*(p_last[pn]+1)+3,z,34,room34);
-   if(pre&&lp<0){if(sre)line_load[ls]-=4;if(is_car){++S.car_dropped;car.registers[u-SCENERY_MAX][3]=0;}else ++S.dropped;continue;}
-   if(pre)line_load[lp]+=34;
-   ++S.reused;
-  }
+  if(sre||pre){++S.reused;if(sre)s_rewritten[sn]=1;if(pre)p_rewritten[pn]=1;}
   if(!shared&&!pre)fresh_p=std::max(fresh_p,unsigned(pn)+1);
   if(!is_car&&!sre)fresh_s=std::max(fresh_s,unsigned(sn)+1);
-  if(pre)++pq_h;                                   // taken from the head
+  if(pre)++pq_h[from_q];                           // taken from the head
   if(sre)++sq_h;
   if(!is_car){sq[sq_t&255]=uint16_t(sn);++sq_t;}
-  if(!shared){pq[pq_t&511]=uint16_t(pn);pq_last[pq_t&511]=int8_t(std::max<int>(p_last[pn]==-100?r:p_last[pn],r));++pq_t;}
+  if(!shared){const unsigned q=SCENERY_REWRITTEN_FIRST&&p_rewritten[pn]?0:1;pq[q][pq_t[q]&511]=uint16_t(pn);pq_last[q][pq_t[q]&511]=int8_t(std::max<int>(p_last[pn]==-100?r:p_last[pn],r));++pq_t[q];}
   p_last[pn]=int8_t(std::max<int>(p_last[pn],r));p_of[u]=uint16_t(pn);
-  if(!shared){p_content[pn]=int16_t(u);p_hash[pn]=hash;jobs[njobs++]={int16_t(lp),1,0,uint16_t(pn),uint16_t(u)};}
+  if(!shared){
+   if(p_content[pn]>=0){int16_t*at=&p_chain_head[chain_of(p_hash[pn])];while(*at!=int16_t(pn))at=&p_chain_next[*at];*at=p_chain_next[pn];}
+   p_content[pn]=int16_t(u);p_hash[pn]=hash;
+   {const unsigned c=chain_of(hash);p_chain_next[pn]=p_chain_head[c];p_chain_head[c]=int16_t(pn);}
+   jobs[njobs++]={int16_t(lp),1,0,uint16_t(pn),uint16_t(u),pmask};}
   else ++S.shared;
   if(is_car){unsigned i=u-SCENERY_MAX;car.registers[i][2]=uint16_t((car.registers[i][2]&0xff00)|(car_pattern_slot(pn)&255));}
-  else{s_last[sn]=int8_t(r);S.sprite[u].kept=1;++S.kept;jobs[njobs++]={int16_t(ls),0,0,uint16_t(sn),uint16_t(u)};}
+  else{s_last[sn]=int8_t(r);S.sprite[u].kept=1;++S.kept;jobs[njobs++]={int16_t(ls),0,0,uint16_t(sn),uint16_t(u),0};}
  }
  // 5. job lists: vertical blank first, then one list per raster interrupt
  unsigned off=0;
- auto emit=[&](const SceneryJob&j){
+ auto emit=[&](const SceneryJob&j,uint32_t m){
+  if(off+300>SCENERY_JOB_LONGS){++scenery_overflow;return;}   // never past the buffer (room for a job and the list ends)
   if(!j.pcg){const ScenerySprite&sp=S.sprite[j.sprite];unsigned n=car_sprites+j.res,pattern=car_pattern_slot(p_of[j.sprite]);
    S.jobs[off++]=0xeb0000UL+n*8;S.jobs[off++]=1;
    S.jobs[off++]=(uint32_t(uint16_t(sp.x))<<16)|uint16_t(sp.y);
    S.jobs[off++]=(uint32_t(((S.first_block+sp.block)<<8)|(pattern&255))<<16)|3u;}
   else{unsigned pattern=car_pattern_slot(j.res);const uint32_t*p=pcg_of(j.sprite);
-   S.jobs[off++]=0xeb8000UL+pattern*128;S.jobs[off++]=31;
-   memcpy(S.jobs+off,p,128);off+=32;}
+   uint32_t*d=S.jobs+off;const uint32_t at=0xeb8000UL+pattern*128;
+   if(m==0xffffffffu){*d++=at;*d++=31;for(unsigned q=0;q<32;q++)*d++=p[q];}
+   else for(unsigned q=0;m;){
+    while(!(m&1)){m>>=1;++q;}
+    uint32_t*const head=d;d+=2;const unsigned first=q;
+    do{*d++=p[q++];m>>=1;}while(m&1);
+    head[0]=at+first*4;head[1]=q-first-1;}
+   off=unsigned(d-S.jobs);}
  };
  static int16_t head[SCENERY_LINES+1],next_job[2*(SCENERY_MAX+128)];
  for(unsigned l=0;l<=SCENERY_LINES;l++)head[l]=-1;
  for(int k=int(njobs)-1;k>=0;k--){unsigned l=jobs[k].line<0?SCENERY_LINES:unsigned(jobs[k].line);next_job[k]=head[l];head[l]=int16_t(k);}
- auto emit_pal=[&](unsigned b){S.jobs[off++]=0xe82200UL;S.jobs[off++]=7;for(unsigned q=0;q<8;q++)S.jobs[off++]=(uint32_t(hud.band_pal[b][q*2])<<16)|hud.band_pal[b][q*2+1];};
- S.start_job=scenery_ref(S,off);
+ auto emit_pal=[&](unsigned b){if(off+300>SCENERY_JOB_LONGS){++scenery_overflow;return;}S.jobs[off++]=0xe82200UL;S.jobs[off++]=7;for(unsigned q=0;q<8;q++)S.jobs[off++]=(uint32_t(hud.band_pal[b][q*2])<<16)|hud.band_pal[b][q*2+1];};
+ const unsigned first_off=off;S.start_job=scenery_ref(S,off);o_start=int32_t(off);
+ {const uint32_t before[3]={scenery_start_longs,scenery_restart_longs,scenery_line_longs};o_longs[0]=before[0];o_longs[1]=before[1];o_longs[2]=before[2];}
+ for(unsigned l=0;l<224;l++)o_line[l]=-1;
  if(hud.active&&hud.bands)emit_pal(0);
- for(int k=head[SCENERY_LINES];k>=0;k=next_job[k])emit(jobs[k]);
+ for(int k=head[SCENERY_LINES];k>=0;k=next_job[k])emit(jobs[k],0xffffffffu);
  S.jobs[off++]=0;
+ scenery_start_longs+=off-first_off;
+ const unsigned line_off=off;
  for(unsigned l=0;l<224;l++){if(!line_load[l])continue;
-  S.line_job[l]=scenery_ref(S,off);
+  S.line_job[l]=scenery_ref(S,off);o_line[l]=int32_t(off);
   for(unsigned b=1;b<hud.bands;b++)if(hud_line[b]==int(l))emit_pal(b);
-  for(int k=head[l];k>=0;k=next_job[k])emit(jobs[k]);
+  for(int k=head[l];k>=0;k=next_job[k])emit(jobs[k],jobs[k].mask);
   S.jobs[off++]=0;
   S.line_longs_max=std::max<unsigned>(S.line_longs_max,line_load[l]);}
+ scenery_line_longs+=off-line_off;
+ // The start state again after a complete pass of the line jobs (the same frame shown once
+ // more): only the sprite numbers and patterns a line job has written, and of a pattern only
+ // the longs that differ from what its last line job left.
+ if(off+4096<=SCENERY_JOB_LONGS){
+  const unsigned restart_off=off;S.restart_job=scenery_ref(S,off);o_restart=int32_t(off);
+  if(hud.active&&hud.bands>1)emit_pal(0);
+  for(int k=head[SCENERY_LINES];k>=0;k=next_job[k]){const SceneryJob&j=jobs[k];
+   if(!j.pcg){if(s_rewritten[j.res])emit(j,0);}
+   else if(p_rewritten[j.res])emit(j,SCENERY_DIFF?diff_mask(pcg_of(unsigned(p_content[j.res])),pcg_of(j.sprite)):0xffffffffu);}
+  S.jobs[off++]=0;
+  scenery_restart_longs+=off-restart_off;
+ }else{S.restart_job=S.start_job;o_restart=o_start;scenery_restart_longs+=line_off-first_off;}
  (void)content_id;
+ // kept for the next frame (r031)
+ o_longs[0]=scenery_start_longs-o_longs[0];o_longs[1]=scenery_restart_longs-o_longs[1];o_longs[2]=scenery_line_longs-o_longs[2];
+ o_head[0]=S.kept;o_head[1]=S.dropped;o_head[2]=S.reused;o_head[3]=S.line_longs_max;o_head[4]=S.shared;o_head[5]=S.car_dropped;
+ for(unsigned i=0;i<S.count;i++)o_kept[i]=S.sprite[i].kept;
+ for(unsigned i=0;i<car_sprites;i++){o_car2[i]=car.registers[i][2];o_car3[i]=car.registers[i][3];}
+ last_S=&S;last_used=off;last_sig=sig;last_ok=key_ok;
 }
+#if defined(OR_X68K)&&defined(CBX68_TRACE)
+// per frame: scenery, capture, tiles (50us units), sprites, game sprite entries, dropped -> FRAMES.BIN
+static uint16_t frame_trace[4096][6];static unsigned frame_trace_n=0;
+#endif
 static void build_scenery(SceneryPacket&S,const uint16_t*pal,CarPacket&car,const HudPacket&hud,bool sprites_on){
 #ifdef OR_X68K
  uint32_t t=platform_fine_clock();
+#ifdef CBX68_TRACE
+ const uint32_t trace_c=scenery_fine_capture,trace_t=scenery_fine_tiles;
+#endif
 #endif
  build_scenery_body(S,pal,car,hud,sprites_on);
 #ifdef OR_X68K
  uint32_t d=platform_fine_clock()-t;scenery_fine_total+=d;if(d>scenery_fine_max)scenery_fine_max=d;
+#ifdef CBX68_TRACE
+ if(frame_trace_n<4096){uint16_t*r=frame_trace[frame_trace_n++];r[0]=uint16_t(d);r[1]=uint16_t(scenery_fine_capture-trace_c);r[2]=uint16_t(scenery_fine_tiles-trace_t);
+  r[3]=S.count;r[4]=uint16_t(osprites.sprite_count);r[5]=uint16_t(S.dropped);}
+#endif
 #endif
  ++scenery_frames;scenery_car_dropped+=S.car_dropped;scenery_shared_total+=S.shared;scenery_count_total+=S.count;scenery_dropped_total+=S.dropped;scenery_reused_total+=S.reused;scenery_bank_drops+=S.dropped_banks;
  scenery_peak=std::max<unsigned>(scenery_peak,S.count);scenery_line_peak=std::max<unsigned>(scenery_line_peak,S.line_longs_max);scenery_block_peak=std::max<unsigned>(scenery_block_peak,S.blocks);
 }
 // Raster/vblank side. scenery_scan points at the job pointer of the next raster interrupt.
 static uint32_t scenery_zero[SCENERY_LINES];
-extern "C" {volatile uint32_t scenery_scan=0;void scenery_vblank(const RoadRow*rows);}
+extern "C" {volatile uint32_t scenery_scan=0;volatile uint16_t scenery_owed=0,scenery_owed_max=0;volatile uint32_t scenery_late_lines=0,scenery_missed=0;volatile uint16_t scenery_line=0,scenery_idle=0;volatile uint8_t scenery_busy=0,scenery_gen=0;void scenery_vblank(const RoadRow*rows);}
 static void scenery_run(const uint32_t*j){
  while(uint32_t dst=*j++){uint32_t n=*j++ +1;
 #ifdef OR_X68K
@@ -1176,16 +1614,56 @@ static void scenery_run(const uint32_t*j){
 #endif
  }
 }
+#if defined(OR_X68K)&&defined(CBX68_TRACE)
+extern volatile uint32_t road_irq_count;
+static uint32_t irq_hist[16],irq_hist_last=0;   // frames by raster interrupts taken (16 a bucket, 224 = all)
+#endif
+#ifdef OR_X68K
+extern RoadRow* volatile road_scan;
+extern "C"{RoadRow* volatile road_scan_end=0;volatile uint8_t scenery_unfinished=0,scenery_dirty=0;}   // set by road_vblank_irq: where the last pass ended
+static const RoadRow*vblank_rows=0;static bool vblank_state_ok=false;static uint32_t scenery_restarts=0,scenery_skipped_blanks=0;
+#endif
+// Runs at interrupt mask 5 with the raster interrupts enabled (road_irq.S: from the vertical
+// blank interrupt, or from the raster interrupt whose job loop that blank found running); the
+// caller has set scenery_scan to 0, so no line job runs while the start state is loaded.
 extern "C" void scenery_vblank(const RoadRow*rows){
- scenery_scan=(uint32_t)(uintptr_t)scenery_zero;
+#if defined(OR_X68K)&&defined(CBX68_TRACE)
+ {const uint32_t n=road_irq_count,d=n-irq_hist_last;irq_hist_last=n;++irq_hist[d>=240?15:d>>4];}
+#endif
+#ifdef OR_X68K
+ if(!rows){vblank_rows=0;return;}
+#else
  if(!rows)return;
+#endif
  const RoadFrame*f=(const RoadFrame*)rows;
- if(!(f->visual.flags&2)&&!f->visual.hud.active)return;
+ if(!(f->visual.flags&2)&&!f->visual.hud.active){
+#ifdef OR_X68K
+  vblank_rows=0;
+#endif
+  return;}
  const SceneryPacket&S=f->visual.scenery;
 #ifdef OR_X68K
- if(S.start_job)scenery_run((const uint32_t*)S.start_job);
-#endif
+ // The same frame again, and its last pass ran every line job on the state this function left:
+ // the sprite numbers and patterns no line job touches still hold the start state.
+ const bool dirty=scenery_dirty;scenery_dirty=0;   // a blank that came during the last blank's work cut that pass off
+ const bool again=rows==vblank_rows&&vblank_state_ok&&!dirty&&!scenery_unfinished&&road_scan_end==rows+224;
+ vblank_rows=rows;vblank_state_ok=false;
+ if(again){if(S.restart_job)scenery_run((const uint32_t*)S.restart_job);++scenery_restarts;}
+ else if(S.start_job)scenery_run((const uint32_t*)S.start_job);
+ // The line jobs start at line 0. When the blank's work ran long, the raster interrupts have
+ // already passed some lines: those are owed, and the loop of the next raster interrupt writes
+ // their lists first, late but in order (a pattern job holds only the longs that differ from
+ // what the job before it left, so none may be left out).
+ {uint16_t sr;__asm__ volatile("move.w %%sr,%0\n ori.w #0x0700,%%sr":"=d"(sr));
+  const unsigned done=unsigned((const RoadRow*)road_scan-rows);
+  scenery_scan=(uint32_t)(uintptr_t)S.line_job;scenery_owed=uint16_t(done<224?done:224);scenery_line=0;
+  __asm__ volatile("move.w %0,%%sr"::"d"(sr));
+  bool late=false;for(unsigned l=0;l<done&&l<224&&!late;l++)if(S.line_job[l])late=true;
+  if(late)++scenery_skipped_blanks;
+  vblank_state_ok=true;}
+#else
  scenery_scan=(uint32_t)(uintptr_t)S.line_job;
+#endif
 }
 #ifndef OR_X68K
 // PC: run the job lists on a model of the sprite registers and PCG, draw every line with the
@@ -1215,6 +1693,10 @@ static void scenery_preview(const RoadFrame&f,uint16_t*out){
   for(int yy=0;yy<16;yy++)for(int xx=0;xx<16;xx++){int x=tx+xx,y=ty+yy;if(x<0||x>=320||y<0||y>=224)continue;
    unsigned b=car.pcg[car.pattern_index[i]][((xx>>3)*2+(yy>>3))*32+(yy&7)*4+((xx&7)>>1)],n=xx&1?b&15:b>>4;
    if(n)expected[y*320+x]=car.palette[slot][n]|0x10000u;}}
+ for(unsigned pass=0;pass<2;pass++){
+ if(pass){   // the same frame shown again: only the restart part of the start state
+  for(unsigned i=0;i<320*224;i++)if(shown[i]!=expected[i]){fprintf(stderr,"SCENERY FAIL raster x=%u y=%u\n",i%320,i/320);std::exit(16);}
+  memset(shown,0,sizeof shown);run(S.restart_job);}
  for(unsigned y=0;y<224;y++){
   run(S.line_job[y]);
   for(int n=127;n>=0;n--){if(!reg[n][3])continue;int top=int(reg[n][1])-16;if(int(y)<top||int(y)>=top+16)continue;
@@ -1224,6 +1706,7 @@ static void scenery_preview(const RoadFrame&f,uint16_t*out){
    for(unsigned xx=0;xx<16;xx++){int x=int(reg[n][0])-16+int(xx);if(x<0||x>=320)continue;
     unsigned b=pcg[pattern*128+((xx>>3)*2+(yy>>3))*32+(yy&7)*4+((xx&7)>>1)],v=xx&1?b&15:b>>4;
     if(v)shown[y*320+x]=(is_car?car.palette[block-3][v]:S.palette[block-S.first_block][v])|0x10000u;}}
+ }
  }
  for(unsigned i=0;i<320*224;i++){
   if(shown[i]!=expected[i]){fprintf(stderr,"SCENERY FAIL raster x=%u y=%u\n",i%320,i/320);std::exit(16);}
@@ -1267,6 +1750,7 @@ static unsigned hud_colour_distance(uint16_t a,uint16_t b){
  int d=0;for(unsigned sh=1;sh<16;sh+=5){int x=int((a>>sh)&31)-int((b>>sh)&31);d+=x*x;}return unsigned(d);}
 static unsigned hud_slot(unsigned b,unsigned v,const uint16_t*pal){
  for(unsigned s=1;s<=hud_band_n[b];s++)if(hud_band_idx[b][s]==v)return s;
+ // (the caller remembers the last colour and its slot, so runs of one colour do not come here)
  for(unsigned k=0;k<hud_band_an[b];k++)if(hud_band_aidx[b][k]==v)return hud_band_aslot[b][k];
  const uint16_t c=pal[v];
  unsigned s=0;
@@ -1283,9 +1767,18 @@ static void build_hud_body(HudPacket&H,const uint16_t*pal,bool car_on_text){
  const uint8_t*tr=video.tile_layer->text_ram;
  const unsigned bank=video.tile_layer->text_bank();
  static uint8_t changed[28][40];uint32_t rows=0;
- for(unsigned my=0;my<28;my++)for(unsigned cx=0;cx<40;cx++){unsigned i=my*128+(cx+24)*2;uint16_t code=uint16_t((tr[i]<<8)|tr[i+1]);
-  changed[my][cx]=!hud_valid||code!=hud_code[my][cx];hud_code[my][cx]=code;
-  if((code>>15)&1){unsigned t=((code&0x1ff)+bank*0x1000)&0x1fff;if(t)rows|=1u<<my;}}
+ // a text row whose 40 codes are the bytes they were last frame is not looked at cell by cell
+ alignas(4) static uint8_t row_bytes[28][80];const bool rows_known=hud_valid&&bank==hud_bank;
+ // 80 bytes as 20 longs when the text RAM row is long-aligned (libc memcmp is a byte loop)
+ auto hud_row_same=[](const uint8_t*a,const uint8_t*b)->bool{
+  if(uintptr_t(a)&3)return !memcmp(a,b,80);
+  const alias_u32*x=(const alias_u32*)a,*y=(const alias_u32*)b;uint32_t d=0;for(unsigned k=0;k<20;k++)d|=x[k]^y[k];return !d;};
+ for(unsigned my=0;my<28;my++){const uint8_t*const rb=tr+my*128+48;
+  if(rows_known&&hud_row_same(rb,row_bytes[my])){memset(changed[my],0,40);rows|=hud_rows_mask&(1u<<my);continue;}
+  memcpy(row_bytes[my],rb,80);
+  for(unsigned cx=0;cx<40;cx++){uint16_t code=uint16_t((rb[cx*2]<<8)|rb[cx*2+1]);
+   changed[my][cx]=!hud_valid||code!=hud_code[my][cx];hud_code[my][cx]=code;
+   if((code>>15)&1){unsigned t=((code&0x1ff)+bank*0x1000)&0x1fff;if(t)rows|=1u<<my;}}}
  const bool full=!hud_valid||++hud_age>=300||bank!=hud_bank||rows!=hud_rows_mask;
  hud_bank=bank;hud_rows_mask=rows;
  if(full){hud_age=0;hud_valid=true;}
@@ -1306,10 +1799,13 @@ static void build_hud_body(HudPacket&H,const uint16_t*pal,bool car_on_text){
    for(unsigned k=0;k<nk;k++)hud_slot(b,cnt_idx[k],pal);
   }
  }
+ unsigned last_v=0,last_b=999,last_s=0;   // hud_slot of the last colour (slots do not change in this loop once given)
  for(unsigned my=0;my<28;my++)for(unsigned cx=0;cx<40;cx++){if(!full&&!changed[my][cx])continue;
   uint8_t*pl=H.planes[H.count];memset(pl,0,32);const unsigned b=hud_row_band[my];
   if(b!=255&&hud_cell_pixels(my,cx,bank,px))for(unsigned r=0;r<8;r++){const uint16_t*src=px+r*8;
-   for(unsigned x=0;x<8;x++){unsigned v=src[x];if(!v)continue;unsigned s=hud_slot(b,v,pal);
+   for(unsigned x=0;x<8;x++){unsigned v=src[x];if(!v)continue;
+    if(v!=last_v||b!=last_b){last_s=hud_slot(b,v,pal);last_v=v;last_b=b;}
+    const unsigned s=last_s;
     for(unsigned p=0;p<4;p++)if(s&(1u<<p))pl[p*8+r]|=uint8_t(0x80>>x);}}
   H.pos[H.count++]=uint16_t(my*40+cx);}
  H.full=full;H.bands=uint16_t(hud_bands);
@@ -1413,7 +1909,9 @@ extern "C" void visuals_native_commit(const RoadFrame*f){
  *(volatile uint16_t*)0xe82500=(c.text_mode||hud.active)?0x12e4:0x06e4;
  if(hud.active){*(volatile uint16_t*)0xe80014=0;*(volatile uint16_t*)0xe80016=0;}   // text palette: scenery job lists
  for(unsigned i=0;i<128;i++)*(volatile uint16_t*)(0xeb0006UL+i*8)=0;
- *(volatile uint16_t*)0xe82600=f->rows[0].control;
+ // (0xe82600 is written by the raster interrupt of line 0, which is armed before this runs; a
+ //  write here could land after a later line has changed it, and lines that keep the value do
+ //  not write it again)
  // r026: palette blocks of the roadside objects (after the car's blocks)
  if(f->visual.flags&2){const SceneryPacket&S=f->visual.scenery;for(unsigned b=0;b<S.blocks;b++)for(unsigned n=1;n<16;n++)*(volatile uint16_t*)(0xe82200UL+(S.first_block+b)*32+n*2)=opaque_colour(S.palette[b][n]);}
  if(!(f->visual.flags&2)||c.overflow)return;
@@ -1521,8 +2019,17 @@ void visuals_print(){
 #ifndef OR_X68K
  report_printf("R027 HUD pixels total=%llu approx=%llu\n",(unsigned long long)hud_pixels_total,(unsigned long long)hud_pixels_approx);
 #endif
+#ifdef CBX68_ASM_CHECK
+ report_printf("ASM CHECK tile_rows calls=%lu to_c=%lu mismatches=%lu finish calls=%lu mismatches=%lu split calls=%lu mismatches=%lu\n",(unsigned long)asm_check[0],(unsigned long)asm_check[1],(unsigned long)asm_check[2],(unsigned long)asm_check[3],(unsigned long)asm_check[4],(unsigned long)asm_check[5],(unsigned long)asm_check[6]);
+#endif
+#ifdef CBX68_TRACE
+ report_printf("TRACE irqs/frame");for(unsigned k=0;k<16;k++)report_printf(" %lu",(unsigned long)irq_hist[k]);report_printf("\nTRACE jobs lag_max=%u late_lines=%lu missed_lists=%lu restarts=%lu late_blanks=%lu\n",(unsigned)scenery_owed_max,(unsigned long)scenery_late_lines,(unsigned long)scenery_missed,(unsigned long)scenery_restarts,(unsigned long)scenery_skipped_blanks);
+ {FILE*tf=fopen("FRAMES.BIN","wb");if(tf){fwrite(frame_trace,12,frame_trace_n,tf);fclose(tf);}}
+#endif
  report_printf("R026 PHASES us capture=%lu colours=%lu tiles=%lu rest=%lu\n",(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_colour*50UL),(unsigned long)(scenery_fine_tiles*50UL),(unsigned long)((scenery_fine_total-scenery_fine_capture-scenery_fine_colour-scenery_fine_tiles)*50UL));
  report_printf("R026 DIAG entries=%lu off=%lu hidden=%lu priority=%lu car=%lu passed=%lu frames_rows=%lu count=%u\n",(unsigned long)scenery_diag[0],(unsigned long)scenery_diag[1],(unsigned long)scenery_diag[2],(unsigned long)scenery_diag[3],(unsigned long)scenery_diag[4],(unsigned long)scenery_diag[5],(unsigned long)scenery_diag[6],(unsigned)osprites.sprite_count);
+ report_printf("R031 PACKET reuses=%lu partial=%lu came_or_went=%lu no_carry=%lu many_rows=%lu\n",(unsigned long)scenery_packet_reuses,(unsigned long)scenery_partial_frames,(unsigned long)scenery_full_why[0],(unsigned long)scenery_full_why[1],(unsigned long)scenery_full_why[2]);
+ report_printf("R026 JOBS longs/frame start=%lu restart=%lu lines=%lu\n",(unsigned long)(scenery_frames?scenery_start_longs/scenery_frames:0),(unsigned long)(scenery_frames?scenery_restart_longs/scenery_frames:0),(unsigned long)(scenery_frames?scenery_line_longs/scenery_frames:0));
  report_printf("R026 SCENERY frames=%lu sprites avg=%lu max=%u dropped=%lu car_dropped=%lu shared=%lu reused=%lu bank_drops=%lu blocks_max=%u line_longs_max=%u overflow=%lu us total=%lu capture=%lu max=%lu\n",(unsigned long)scenery_frames,(unsigned long)(scenery_frames?scenery_count_total/scenery_frames:0),scenery_peak,(unsigned long)scenery_dropped_total,(unsigned long)scenery_car_dropped,(unsigned long)scenery_shared_total,(unsigned long)scenery_reused_total,(unsigned long)scenery_bank_drops,scenery_block_peak,scenery_line_peak,(unsigned long)scenery_overflow,(unsigned long)(scenery_fine_total*50UL),(unsigned long)(scenery_fine_capture*50UL),(unsigned long)(scenery_fine_max*50UL));
 #ifndef OR_X68K
  report_printf("R026 SCENERY pixels total=%llu dropped=%llu shadow_undarkened=%llu\n",(unsigned long long)scenery_pixels_total,(unsigned long long)scenery_dropped_pixels,(unsigned long long)scenery_shadow_pixels);
@@ -1539,5 +2046,6 @@ void visuals_print(){
  report_printf("R019 COMMIT calls=%lu us avg=%lu max=%lu\n",(unsigned long)commit_calls,(unsigned long)(commit_calls?commit_counts_total*50UL/commit_calls:0),(unsigned long)(commit_counts_max*50UL));
 #endif
  report_printf("R030 SCENERY REUSE frames=%lu of %lu\n",(unsigned long)scenery_reuse_frames,(unsigned long)scenery_frames);
+ report_printf("R044 SCENERY SLOTS overflow=%lu\n",(unsigned long)scenery_slot_overflow);
  report_printf("R030 STATIC PICTURE frames=%lu composes=%lu colours=%u\n",(unsigned long)static_frames,(unsigned long)static_composes,static_ncol);
  report_printf("BACKGROUND source_frames=%lu rebuilds=%lu capacity_waits=%lu recomposed_rows=%lu\n",(unsigned long)background_source_frames,(unsigned long)background_rebuilds,(unsigned long)background_capacity_waits,(unsigned long)background_recomposed_rows);report_printf("BG TRANSFER far_checks=%lu data_errors=%lu palette_errors=%lu\n",(unsigned long)background_far_checks,(unsigned long)background_data_errors,(unsigned long)background_palette_errors);}

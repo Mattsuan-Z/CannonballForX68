@@ -22,6 +22,8 @@
 #include "engine/otraffic.hpp"
 #include "engine/data/ozoom_lookup.hpp"
 
+namespace cannonball { extern bool skip_render; }   // Cannonball for x68, see main.hpp
+
 OSprites osprites;
 
 OSprites::OSprites(void)
@@ -46,6 +48,8 @@ void OSprites::init()
         sprite_order[i] = 0;
         sprite_order2[i] = 0;
     }
+    for (uint16_t i = 0; i < 0x200; i++)
+        sprite_order_count[i] = 0;
 
     // Reset hardware entries
     for (uint16_t i = 0; i < JUMP_ENTRIES_TOTAL; i++)
@@ -140,8 +144,12 @@ void OSprites::update_sprites()
 	{
         do_sprite_swap = false;
         video.sprite_layer->swap();
-        copy_palette_data();
 	}
+    if (do_palette_copy)
+    {
+        do_palette_copy = false;
+        copy_palette_data();
+    }
 }
 
 // Disable All Sprite Entries
@@ -369,13 +377,13 @@ void OSprites::do_spr_order_shadows(oentry* input)
 
     // Use priority as lookup into table. Assume we're on boundaries of 0x10
     uint16_t priority = (input->priority & 0x1FF) << 4;
-    uint8_t bytes_to_copy = sprite_order[priority];
+    uint8_t bytes_to_copy = sprite_order_count[priority >> 4];
 
     // Maximum number of bytes we want to copy is 0x10
     if (bytes_to_copy < 0xE)
     {
         bytes_to_copy++;
-        sprite_order[priority] = bytes_to_copy;
+        sprite_order_count[priority >> 4] = bytes_to_copy;
         sprite_order[priority + bytes_to_copy + 1] = input->jump_index; // put at offset +2
         spr_cnt_main++;
     }
@@ -452,7 +460,7 @@ void OSprites::sprite_copy()
     while (spr_cnt_main_copy != 0)
     {
         src_addr += 0x10;
-        uint8_t bytes_to_copy = sprite_order[src_addr]; // warning: actually reads a word here normally, so this is wrong
+        uint8_t bytes_to_copy = sprite_order_count[src_addr >> 4]; // warning: actually reads a word here normally, so this is wrong
 
         // Copy the required number of bytes
         if (bytes_to_copy != 0)
@@ -470,7 +478,7 @@ void OSprites::sprite_copy()
         }
 
         // Clear number of bytes to copy
-        sprite_order[src_addr] = 0; 
+        sprite_order_count[src_addr >> 4] = 0; 
     }
 
     // cont2:
@@ -505,13 +513,18 @@ void OSprites::finalise_sprites()
     sprite_entries[sprite_count].data[1] = 0xFFFF;
 
     // TODO: Code to wait for interrupt goes here
-    blit_sprites();
+    // Cannonball for x68: no copy to the sprite RAM and no exchange of its halves for a step whose
+    // picture is not drawn.
+    if (!cannonball::skip_render)
+        blit_sprites();
     otraffic.traffic_logic();
     otraffic.traffic_sound();
     spr_cnt_main = spr_cnt_shadow = 0;
 
     // Ready to swap buffer and blit
-    do_sprite_swap = true;
+    if (!cannonball::skip_render)
+        do_sprite_swap = true;
+    do_palette_copy = true;
 }
 
 // Copy Sprite Data to Sprite RAM 

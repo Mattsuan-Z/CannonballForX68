@@ -18,6 +18,7 @@
     See license.txt for more details.
 ***************************************************************************/
 
+#include <cstring>
 #include "stdint.hpp"
 #include "globals.hpp"
 #include "assets.hpp"
@@ -29,6 +30,8 @@
 
 #include "engine/oroad.hpp"
 #include "engine/ostats.hpp"
+
+namespace cannonball { extern bool skip_render; }   // Cannonball for x68, see main.hpp
 
 ORoad oroad;
 
@@ -198,6 +201,13 @@ void ORoad::do_road()
     set_road_y();
     set_horizon_y();
     do_road_data();
+
+    // Cannonball for x68: the rest only fills the road RAM that the picture is made from. When
+    // this step's picture is not drawn it is left out, and the halves are not exchanged, so the
+    // shown half stays the one of the last picture.
+    if (cannonball::skip_render)
+        return;
+
     blit_roads();
     output_hscroll(&road0_h[0], HW_HSCROLL_TABLE0);
     output_hscroll(&road1_h[0], HW_HSCROLL_TABLE1);
@@ -1528,53 +1538,22 @@ void ORoad::blit_road(uint32_t a0)
     uint32_t a2 = 0x400 + road_p2;
 
     // Write 0x1A0 bytes total Src: (0x260 - 0x400) Dst: 0x1C0
-    for (int16_t i = 0; i <= 13; i++)
-    {
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-        a0 -= 2; hwroad.write16(a0, road_y[--a2]);
-    }
+    // (cbx68: the 224 words go to road RAM words (a0>>1)-224 .. (a0>>1)-1, 0x00..0xdf or
+    // 0x100..0x1df, in the same order as in road_y: one block copy, the same words as the
+    // original's 224 write16 calls from the top down)
+    memcpy(&hwroad.ram[((a0 >> 1) & 0x7FF) - 224], &road_y[a2 - 224], 224 * 2);
 }
 
 void ORoad::output_hscroll(int16_t* src, uint32_t dst)
 {
     const int32_t d6 = 0x654;
-    uint32_t src_addr = 0;
 
     // Copy 16 bytes
-    for (int32_t i = 0; i <= 0x3F; i++)
-    {
-        int16_t d0h = -src[src_addr++] + d6;
-        int16_t d0l = -src[src_addr++] + d6;
-        int16_t d1h = -src[src_addr++] + d6;
-        int16_t d1l = -src[src_addr++] + d6;
-        int16_t d2h = -src[src_addr++] + d6;
-        int16_t d2l = -src[src_addr++] + d6;
-        int16_t d3h = -src[src_addr++] + d6;
-        int16_t d3l = -src[src_addr++] + d6;
-        hwroad.write16(&dst, d0h);
-        hwroad.write16(&dst, d0l);
-        hwroad.write16(&dst, d1h);
-        hwroad.write16(&dst, d1l);
-        hwroad.write16(&dst, d2h);
-        hwroad.write16(&dst, d2l);
-        hwroad.write16(&dst, d3h);
-        hwroad.write16(&dst, d3l);
-    }
+    // (cbx68: 512 words to road RAM words (dst>>1).., 0x200.. or 0x400.., no wrap: written
+    // directly, the same words as the original's write16 calls)
+    uint16_t* out = &hwroad.ram[(dst >> 1) & 0x7FF];
+    for (int32_t i = 0; i < 512; i++)
+        out[i] = uint16_t(d6 - src[i]);
 }
 
 // Copy Background Colour To Road.
@@ -1603,6 +1582,12 @@ void ORoad::copy_bg_color()
     uint32_t dst = HW_BGCOLOR;
 
     // Copy 1K
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    // X68000: the ROM bytes already are the big-endian words of road RAM, and the 512 words
+    // (road RAM words 0x600..0x7ff) do not wrap: one block copy, the same words as the loop below.
+    memcpy(&hwroad.ram[(dst >> 1) & 0x7FF], assets.asset1p->asset + src, 1024);
+    return;
+#endif
     for (int i = 0; i < 32; i++)
     {
         hwroad.write32(&dst, assets.asset1p->read32(&src));

@@ -76,9 +76,9 @@ static void colors(const HWRoad&r,unsigned which,unsigned data,unsigned cw,unsig
 static const uint8_t*road_lines=0;
 // Rows of graphic page 1 currently holding road line n (-1 = off-road), per row set.
 static int16_t road_page_line[2][224];static bool road_page_init=false;
-#ifndef OR_X68K
-static uint8_t road_page[512*512];   // PC model of the page-1 classes
-#endif
+// PC: model of the page-1 classes. X68000 (r031k): a copy in main memory of what the page holds,
+// so a row is given only the bytes that differ from the line it held before.
+static uint8_t road_page[512*512];
 static int16_t line_min[256],line_max[256];
 static void road_line_bounds(const HWRoad&r){
  if(road_lines==r.roads)return;
@@ -98,20 +98,7 @@ void road_build(const HWRoad&r,const uint16_t*pal,RoadFrame&f){
  unsigned control=r.road_control&3;
  for(int y=0;y<224;y++){
   RoadRow& row=f.rows[y];unsigned d[2]={r.ramBuff[y],r.ramBuff[256+y]};
-  unsigned ix[2]={(r.road_control&4)?unsigned(y):(d[0]&511),(r.road_control&4)?unsigned(y+256):(d[1]&511)};
-  unsigned cw[2]={r.ramBuff[0x600+ix[0]],r.ramBuff[0x600+ix[1]]};
-  unsigned co[2][5];colors(r,0,d[0],cw[0],co[0]);colors(r,1,d[1],cw[1],co[1]);
   bool on[2]={(d[0]&2048)==0&&(control!=3),(d[1]&2048)==0&&(control!=0)};
-  unsigned primary=(control==2||control==3)?1:0,secondary=1-primary;
-  uint32_t xy[2];int col[2];
-  for(unsigned i=0;i<2;i++){
-   col[i]=column(r,i,ix[i]);int tex=480;
-   if(on[i]&&col[i]>=-320&&col[i]<512)tex=road_atlas.vtab[col[i]+320]+road_atlas.lrow[(d[i]>>1)&255];
-   else if(on[i])++f.variant_miss;
-   xy[i]=scroll(tex==480?0:col[i],tex,y);
-  }
-  // Colour of a pixel where both roads are off-road (priority map, both pixels 3).
-  unsigned offroad=(control<=1)?co[0][3]:co[1][3];
   row.bg_y=row.bg_far_y=(256-y)&511;row.control=0x004c;
   row.next=y==223?1023:72+(y+1)*2;
   unsigned mode;
@@ -123,6 +110,20 @@ void road_build(const HWRoad&r,const uint16_t*pal,RoadFrame&f){
    row.bg0=row.bg1=scroll(0,480,y);row.gpage=f.gv_base;row.road_enable=0x0210;mode=ROW_HIDDEN;
   }else{
    ++f.visible;
+   // (the colours, columns and textures are only needed on lines that show a road)
+   unsigned ix[2]={(r.road_control&4)?unsigned(y):(d[0]&511),(r.road_control&4)?unsigned(y+256):(d[1]&511)};
+   unsigned cw[2]={r.ramBuff[0x600+ix[0]],r.ramBuff[0x600+ix[1]]};
+   unsigned co[2][5];colors(r,0,d[0],cw[0],co[0]);colors(r,1,d[1],cw[1],co[1]);
+   unsigned primary=(control==2||control==3)?1:0,secondary=1-primary;
+   uint32_t xy[2];int col[2];
+   for(unsigned i=0;i<2;i++){
+    col[i]=column(r,i,ix[i]);int tex=480;
+    if(on[i]&&col[i]>=-320&&col[i]<512)tex=road_atlas.vtab[col[i]+320]+road_atlas.lrow[(d[i]>>1)&255];
+    else if(on[i])++f.variant_miss;
+    xy[i]=scroll(tex==480?0:col[i],tex,y);
+   }
+   // Colour of a pixel where both roads are off-road (priority map, both pixels 3).
+   unsigned offroad=(control<=1)?co[0][3]:co[1][3];
    // Show exactly the higher-priority road that has pixels on screen; the other one (if on
    // screen) goes to BG1.
    bool vis[2];
@@ -188,7 +189,91 @@ void road_build(const HWRoad&r,const uint16_t*pal,RoadFrame&f){
   }
   f.mode[y]=mode;
  }
+ // A row that has a BG plane off (road_enable bit 0: BG0, bit 3: BG1) shows nothing of that
+ // plane, whatever its scroll register holds: most rows show the road from the graphic page with
+ // both planes off. Inside a run of rows with the plane off, a row takes the scroll value of
+ // the row above, so the raster interrupt does not write the register on that line
+ // (row_changed). The first and the last row of such a run keep their own values (and so does
+ // row 223, before row 0 of the next frame), because what the register holds there is shown:
+ // - first row: the interrupt writes the scroll before the control register while the line is
+ //   already being shown, so the plane still shows until the control register is written;
+ // - last row: the row after it turns the plane on, and its first lines are still drawn with
+ //   the scroll of the row before (XEiJ, the same frame held on the screen with and without
+ //   this change: with every row of the run taking the value above, a 48 pixel piece of road
+ //   texture appeared on the first row of the road, where the plane comes on).
+ for(unsigned y=1;y<223;y++){RoadRow&row=f.rows[y];const RoadRow&up=f.rows[y-1],&down=f.rows[y+1];   // (downwards: the rows inside a run take the value of its first row)
+  if(!(row.road_enable&1)&&!(up.road_enable&1)&&!(down.road_enable&1))row.bg0=up.bg0;
+  if(!(row.road_enable&8)&&!(up.road_enable&8)&&!(down.road_enable&8))row.bg1=up.bg1;}
+ // #56: the raster interrupt of a row runs on the last line of the row before, and on a fast
+ // machine its first writes are already shown on that line (XEiJ 060turbo: the BG scrolls and the
+ // graphic scroll; pix68k 75 MHz: the palettes as well). Where a row whose graphic page shows one
+ // colour (all five ground colours the same: road from the BG atlas, or no road) meets a row that
+ // shows a road line from the page, the one-colour row takes the graphic scroll and the page line
+ // of that neighbour: its own picture does not change (one colour whatever the page holds there),
+ // and whatever part of its writes comes a line early, the line shows the neighbour's road line,
+ // not a road line moved to scroll 0 or an old page row. (One-colour runs of two or more rows take
+ // the row below at their last row, so the next road row's early writes find its own line there.)
+ auto flat=[&](unsigned y){const RoadRow&r=f.rows[y];for(unsigned k=1;k<5;k++)if(r.ground[k]!=r.ground[0])return false;return true;};
+ for(unsigned y=1;y<224;y++)if(flat(y)&&!flat(y-1)&&f.gv_line[y-1]>=0){f.rows[y].gpage=f.rows[y-1].gpage;f.gv_line[y]=f.gv_line[y-1];}
+ for(int y=222;y>=1;y--)if(flat(y)&&flat(y-1)&&!flat(y+1)&&f.gv_line[y+1]>=0){f.rows[y].gpage=f.rows[y+1].gpage;f.gv_line[y]=f.gv_line[y+1];}
 }
+// After everything that changes the rows (road_build, visuals_build): see RoadFrame::row_changed.
+// CBX68_PROF: every row keeps its interrupt (the profiler takes one sample a line).
+// (the colour groups compared as longs: libc memcmp on the 68k is a byte loop behind a call)
+typedef uint32_t row_u32 __attribute__((__may_alias__));
+static inline bool row_ne(const uint16_t*a,const uint16_t*b,unsigned words){
+ const row_u32*x=(const row_u32*)a,*y=(const row_u32*)b;uint32_t d=0;
+ for(unsigned k=0;k<words/2;k++)d|=x[k]^y[k];
+ if(words&1)d|=uint32_t(a[words-1]^b[words-1]);
+ return d!=0;}
+void road_rows_changed(RoadFrame&f){
+ f.row_changed[0]=0x3ff;
+ for(unsigned y=1;y<224;y++){const RoadRow&a=f.rows[y-1],&b=f.rows[y];unsigned m=0;
+  if(a.bg0!=b.bg0)m|=1;if(a.bg1!=b.bg1)m|=2;if(a.gpage!=b.gpage)m|=4;
+  if(row_ne(a.front,b.front,4))m|=8;if(row_ne(a.back,b.back,4))m|=16;if(row_ne(a.ground,b.ground,5))m|=32;
+  if(a.bg_y!=b.bg_y)m|=64;if(a.bg_far_y!=b.bg_far_y)m|=128;if(a.control!=b.control)m|=256;if(a.road_enable!=b.road_enable)m|=512;
+  f.row_changed[y]=uint16_t(m);}
+ // Rows that need no raster interrupt: no register to write and no job list of the scenery.
+ // Every row says how many such rows follow it (bits 10-15, at most 63); the interrupt of a
+ // row steps over them (road_irq.S).
+#ifndef CBX68_PROF
+ const uint32_t*const job=f.visual.scenery.line_job;unsigned run=0;
+ for(int y=223;y>=0;y--){
+  const bool idle=!f.row_changed[y]&&!job[y];
+  f.row_changed[y]=uint16_t(f.row_changed[y]|((run<63?run:63)<<10));
+  run=idle?run+1:0;}
+#endif
+}
+#ifndef OR_X68K
+// PC check of road_rows_changed(): what the raster interrupt (road_irq.S) does with the rows.
+// It writes the register groups named in a row's mask; from row `from` on (the row at which the
+// job lists start to run) it then steps over the rows the mask says need no interrupt, and asks
+// for the next interrupt at the line worked out as in the assembly. Every row, stepped over or
+// not, must find all its values in the registers, no row with a job list may be stepped over,
+// and the next interrupt must be at the row the steps end at. Tried for every `from`.
+// Returns 0, or the failing row + 1.
+unsigned road_rows_check(const RoadFrame&f){
+ for(unsigned from=0;from<=224;from++){
+  RoadRow reg;memset(&reg,0,sizeof reg);
+  auto same=[&](const RoadRow&r){return reg.bg0==r.bg0&&reg.bg1==r.bg1&&reg.gpage==r.gpage&&!memcmp(reg.front,r.front,sizeof r.front)&&!memcmp(reg.back,r.back,sizeof r.back)&&
+   !memcmp(reg.ground,r.ground,sizeof r.ground)&&reg.bg_y==r.bg_y&&reg.bg_far_y==r.bg_far_y&&reg.control==r.control&&reg.road_enable==r.road_enable;};
+  unsigned y=0;
+  while(y<224){
+   const RoadRow&r=f.rows[y];const unsigned m=f.row_changed[y];unsigned skip=m>>10;
+   if(m&1)reg.bg0=r.bg0;if(m&2)reg.bg1=r.bg1;if(m&4)reg.gpage=r.gpage;
+   if(m&8)memcpy(reg.front,r.front,sizeof r.front);if(m&16)memcpy(reg.back,r.back,sizeof r.back);if(m&32)memcpy(reg.ground,r.ground,sizeof r.ground);
+   if(m&64)reg.bg_y=r.bg_y;if(m&128)reg.bg_far_y=r.bg_far_y;if(m&256)reg.control=r.control;if(m&512)reg.road_enable=r.road_enable;
+   if(!same(r))return y+1;
+   if(y<from)skip=0;
+   unsigned line=r.next;if(skip){line=(r.next+2*skip)&0xffff;if(line>=72+224*2)line=1023;}
+   const unsigned n=y+1+skip;
+   if(n>224||line!=(n==224?1023u:72+n*2))return y+1;
+   for(unsigned k=y+1;k<n;k++)if(!same(f.rows[k])||f.visual.scenery.line_job[k])return k+1;
+   y=n;}
+ }
+ return 0;
+}
+#endif
 static unsigned bgpixel(const uint16_t*map,uint32_t xy,int x,int y){
  unsigned sx=((xy>>16)+x)&511,sy=((xy&511)+y)&511;
  unsigned code=map[(sy>>3)*64+(sx>>3)]&255;
@@ -209,9 +294,7 @@ void road_preview(const RoadFrame&f,uint16_t*out){
 void road_stream(const RoadFrame&f){
  if(!road_page_init){
   for(unsigned b=0;b<2;b++)for(unsigned y=0;y<224;y++)road_page_line[b][y]=-1;
-#ifndef OR_X68K
-  memset(road_page,3,sizeof road_page);
-#endif
+  memset(road_page,3,sizeof road_page);   // (X68000: platform_init fills the page with class 3)
   road_page_init=true;
  }
  unsigned set=f.gv_base?1:0;
@@ -221,11 +304,14 @@ void road_stream(const RoadFrame&f){
   const uint8_t*src=road_lines+l*512;
 #ifdef OR_X68K
   // upper byte of each 16-bit pixel = page 1; the lower byte (background) is not touched
+  // Neighbouring road lines differ in a few pixels (the edges move by one or two), and a GVRAM
+  // byte costs 0.47 us on the real bus: compared 4 pixels at a time with the copy, and only the
+  // bytes that differ are written.
   volatile uint8_t*dst=(volatile uint8_t*)(0xc00000UL+(f.gv_base+y)*1024UL);
-  for(unsigned x=0;x<512;x+=8){
-   dst[0]=0xf0|src[0];dst[2]=0xf0|src[1];dst[4]=0xf0|src[2];dst[6]=0xf0|src[3];
-   dst[8]=0xf0|src[4];dst[10]=0xf0|src[5];dst[12]=0xf0|src[6];dst[14]=0xf0|src[7];
-   dst+=16;src+=8;
+  uint8_t*have=road_page+(f.gv_base+y)*512;
+  for(unsigned x=0;x<512;x+=4){
+   if(*(const uint32_t*)(src+x)==*(const uint32_t*)(have+x))continue;
+   for(unsigned k=x;k<x+4;k++)if(have[k]!=src[k]){have[k]=src[k];dst[k*2]=0xf0|src[k];}
   }
 #else
   memcpy(road_page+(f.gv_base+y)*512,src,512);
